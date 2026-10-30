@@ -865,6 +865,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
 
+        // Task/mesh pipelines are not stored (their mesh registers are not in the format); skip
+        // any that were.
+        if (std::ranges::any_of(envs, [](const FileEnvironment& env) {
+                return env.ShaderStage() == Shader::Stage::Task ||
+                       env.ShaderStage() == Shader::Stage::Mesh;
+            })) {
+            return;
+        }
+
         if ((key.state.extended_dynamic_state != 0) !=
                 dynamic_features.has_extended_dynamic_state ||
             (key.state.extended_dynamic_state_2 != 0) !=
@@ -1442,7 +1451,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
-    SerializeGraphicsPipeline(graphics_key, std::move(environments.envs));
+    SerializeGraphicsPipeline(*pipeline, graphics_key, std::move(environments.envs));
     QueueVulkanPipelineCacheFlush();
     return pipeline;
 }
@@ -1461,14 +1470,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipelineFromReuse
     }
     ReportRuntimePipeline("Graphics (reused shaders)", begin);
     if (!pipeline_cache_filename.empty()) {
-        SerializeGraphicsPipeline(graphics_key, std::move(environments.envs));
+        SerializeGraphicsPipeline(*pipeline, graphics_key, std::move(environments.envs));
         QueueVulkanPipelineCacheFlush();
     }
     return pipeline;
 }
 
-void PipelineCache::SerializeGraphicsPipeline(const GraphicsPipelineCacheKey& key,
+void PipelineCache::SerializeGraphicsPipeline(const GraphicsPipeline& pipeline,
+                                              const GraphicsPipelineCacheKey& key,
                                               GraphicsEnvironmentArray envs) {
+    if (pipeline.IsMeshPipeline()) {
+        // Not stored: task and mesh programs are translated with the mesh registers, which the
+        // cache format does not carry. The few of them rebuild quickly from the driver cache.
+        return;
+    }
     // Once per key: a pipeline in the disk cache already was only not built at boot (or was
     // evicted and is built again).
     if (!disk_pipelines.insert(key.Hash()).second) {
@@ -1578,7 +1593,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptTranslatedGraphicsPipeline
     GetTranslationReport().Adopted(result.build_time);
     // What CreateGraphicsPipeline() does after building on the GPU thread.
     if (result.pipeline && !pipeline_cache_filename.empty()) {
-        SerializeGraphicsPipeline(result.key, std::move(result.envs));
+        SerializeGraphicsPipeline(*result.pipeline, result.key, std::move(result.envs));
         QueueVulkanPipelineCacheFlush();
     }
     return std::move(result.pipeline);

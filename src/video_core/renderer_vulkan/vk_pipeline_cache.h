@@ -169,7 +169,8 @@ private:
     std::unique_ptr<GraphicsPipeline> AdoptTranslatedGraphicsPipeline(
         std::future<TranslatedGraphicsPipeline>& translated);
 
-    void SerializeGraphicsPipeline(const GraphicsPipelineCacheKey& key,
+    void SerializeGraphicsPipeline(const GraphicsPipeline& pipeline,
+                                   const GraphicsPipelineCacheKey& key,
                                    GraphicsEnvironmentArray envs);
 
     /// With `allow_translation` false, only builds pipelines from reused shaders (else null).
