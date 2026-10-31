@@ -66,6 +66,11 @@ public:
     /// A new kernel on this memory: everything a previous one used may hold data.
     void ForgetContents();
 
+    /// Memory written once and read again rarely: its pages leave the working set (backing and,
+    /// when given, its view at virtual_offset), so the OS compresses or pages them out first when
+    /// it needs RAM. The contents stay; using the pages brings them back.
+    void HintCold(size_t physical_offset, size_t length, std::optional<size_t> virtual_offset);
+
     [[nodiscard]] u8* BackingBasePointer() noexcept {
         return backing_base;
     }
