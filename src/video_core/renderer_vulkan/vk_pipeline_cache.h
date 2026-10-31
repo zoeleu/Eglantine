@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <filesystem>
 #include <future>
+#include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <optional>
 #include <type_traits>
@@ -247,6 +249,16 @@ private:
     Shader::HostTranslateInfo host_info;
 
     std::filesystem::path pipeline_cache_filename;
+
+    /// Key hashes of the graphics pipelines in the disk cache. Only those a recent session used
+    /// (used_pipelines) are built at boot; the rest are built when first needed, and not stored
+    /// again. Each built pipeline holds driver memory (title 1: 6.5k cached, a quarter used).
+    std::unordered_set<u64> disk_pipelines;
+    std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
+    std::unordered_set<const GraphicsPipeline*> used_this_session;
+    std::filesystem::path used_pipelines_filename;
+    std::chrono::steady_clock::time_point used_pipelines_saved{};
+    void SaveUsedPipelines();
 
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;

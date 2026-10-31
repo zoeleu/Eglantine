@@ -646,10 +646,77 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         device.SupportsTransformFeedbackProvokingVertexPreservation();
 }
 
+namespace {
+// <title>/vulkan_used.bin: the graphics pipelines recent sessions used, as key hash + sessions
+// since the last use.
+constexpr u32 UsedPipelinesMagic = 0x31505545; // "EUP1"
+constexpr u8 UsedPipelinesMaxAge = 8;
+
+std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path) {
+    std::unordered_map<u64, u8> used;
+    std::ifstream file{path, std::ios::binary};
+    u32 magic{}, count{};
+    if (!file.read(reinterpret_cast<char*>(&magic), sizeof(magic)) || magic != UsedPipelinesMagic ||
+        !file.read(reinterpret_cast<char*>(&count), sizeof(count))) {
+        return used;
+    }
+    used.reserve(count);
+    for (u32 i = 0; i < count; ++i) {
+        u64 hash{};
+        u8 age{};
+        if (!file.read(reinterpret_cast<char*>(&hash), sizeof(hash)) ||
+            !file.read(reinterpret_cast<char*>(&age), sizeof(age))) {
+            break;
+        }
+        used.emplace(hash, age);
+    }
+    return used;
+}
+
+// EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
+bool PreloadAllPipelines() {
+    static const bool all = [] {
+        const char* value = std::getenv("EDEN_NX2_PRELOAD_ALL_PIPELINES");
+        return value != nullptr && value[0] == '1';
+    }();
+    return all;
+}
+} // Anonymous namespace
+
 PipelineCache::~PipelineCache() {
+    SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
+    }
+}
+
+void PipelineCache::SaveUsedPipelines() {
+    used_pipelines_saved = std::chrono::steady_clock::now();
+    // A session too short to say what the game uses (a boot to the menu) keeps the old list.
+    constexpr size_t MinimumUsed = 64;
+    if (used_pipelines_filename.empty() || used_this_session.size() < MinimumUsed) {
+        return;
+    }
+    std::unordered_map<u64, u8> next;
+    next.reserve(used_pipelines.size() + used_this_session.size());
+    for (const auto& [key, pipeline] : graphics_cache) {
+        if (used_this_session.contains(pipeline.get())) {
+            next.emplace(key.Hash(), u8{0});
+        }
+    }
+    for (const auto& [hash, age] : used_pipelines) {
+        if (age + 1 < UsedPipelinesMaxAge) {
+            next.try_emplace(hash, static_cast<u8>(age + 1));
+        }
+    }
+    std::ofstream file{used_pipelines_filename, std::ios::binary | std::ios::trunc};
+    const u32 count = static_cast<u32>(next.size());
+    file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
+    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    for (const auto& [hash, age] : next) {
+        file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+        file.write(reinterpret_cast<const char*>(&age), sizeof(age));
     }
 }
 
@@ -731,6 +798,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         return;
     }
     pipeline_cache_filename = base_dir / "vulkan.bin";
+    used_pipelines_filename = base_dir / "vulkan_used.bin";
+    used_pipelines = LoadUsedPipelines(used_pipelines_filename);
+    used_pipelines_saved = std::chrono::steady_clock::now();
+    size_t skipped_pipelines = 0;
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename = base_dir / "vulkan_pipelines.bin";
@@ -799,6 +870,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             return;
         }
 
+        const u64 hash = key.Hash();
+        disk_pipelines.insert(hash);
+        if (!PreloadAllPipelines() && !used_pipelines.empty() && !used_pipelines.contains(hash)) {
+            ++skipped_pipelines;
+            return;
+        }
+
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
             ShaderPools pools;
             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
@@ -823,6 +901,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                load_graphics);
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (skipped_pipelines != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "{} cached graphics pipelines no recent session used are built when first needed",
+                 skipped_pipelines);
+    }
 
     std::unique_lock lock{state.mutex};
     callback(VideoCore::LoadCallbackStage::Build, 0, state.total);
@@ -938,6 +1021,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     auto& pipeline{it->second};
     if (!pipeline) {
         return nullptr;
+    }
+    if (used_this_session.insert(pipeline.get()).second &&
+        std::chrono::steady_clock::now() - used_pipelines_saved > std::chrono::minutes{2}) {
+        SaveUsedPipelines();
     }
     if (current_pipeline) {
         current_pipeline->AddTransition(pipeline.get());
@@ -1283,7 +1370,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
-    SerializeGraphicsPipeline(graphics_key, std::move(environments.envs));
+    if (!disk_pipelines.contains(graphics_key.Hash())) {
+        // Not in the disk cache yet (otherwise it is there, only not built at boot).
+        SerializeGraphicsPipeline(graphics_key, std::move(environments.envs));
+    }
     QueueVulkanPipelineCacheFlush();
     return pipeline;
 }
@@ -1301,7 +1391,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipelineFromReuse
         return nullptr;
     }
     ReportRuntimePipeline("Graphics (reused shaders)", begin);
-    if (!pipeline_cache_filename.empty()) {
+    if (!pipeline_cache_filename.empty() && !disk_pipelines.contains(graphics_key.Hash())) {
         SerializeGraphicsPipeline(graphics_key, std::move(environments.envs));
         QueueVulkanPipelineCacheFlush();
     }
