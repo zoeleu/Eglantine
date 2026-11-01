@@ -8,6 +8,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/command_write_log.h"
 #include "common/logging.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
@@ -299,14 +300,14 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
         std::memcpy(page_pointer, &data, sizeof(T));
-        NoteCommandMemoryWrite(addr, sizeof(T));
+        Common::CommandWriteLog::Get().Note(page_pointer, sizeof(T));
         return;
     }
     // A Switch 2 sparse block nobody wrote yet gets its memory now.
     Tegra::Nx2BackSparseWrite(addr, sizeof(T));
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         std::memcpy(page_pointer, &data, sizeof(T));
-        NoteCommandMemoryWrite(addr, sizeof(T));
+        Common::CommandWriteLog::Get().Note(page_pointer, sizeof(T));
         return;
     }
 
@@ -479,6 +480,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         }
         if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
             std::memcpy(physical, src_buffer, copy_amount);
+            Common::CommandWriteLog::Get().Note(physical, copy_amount);
         }
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
@@ -492,6 +494,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         } else {
             u8* physical = memory.GetPointer<u8>(dev_addr_base);
             std::memcpy(physical, src_buffer, copy_amount);
+            Common::CommandWriteLog::Get().Note(physical, copy_amount);
         }
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
@@ -500,62 +503,35 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         MemoryOperation(base, copy_amount, false, mapped_normal, just_advance, just_advance);
     };
     MemoryOperation(gpu_dest_addr, size, true, mapped_big, just_advance, write_short_pages);
-    if (size != 0) {
-        NoteCommandMemoryWrite(gpu_dest_addr, size);
-    }
 }
 
 void MemoryManager::MarkCommandMemory(GPUVAddr gpu_addr, std::size_t size) {
-    if (size == 0) {
-        return;
-    }
-    const u64 first = gpu_addr >> command_page_bits;
-    const u64 last = (gpu_addr + size - 1) >> command_page_bits;
-    for (u64 page = first; page <= last; ++page) {
-        command_pages[CommandFilterIndex(page)].store(1, std::memory_order_relaxed);
-    }
+    ForEachHostRange(gpu_addr, size, [](const u8* pointer, std::size_t amount) {
+        Common::CommandWriteLog::Get().Mark(pointer, amount);
+    });
 }
 
-void MemoryManager::LogCommandMemoryWrite(GPUVAddr gpu_addr, std::size_t size) {
-    std::scoped_lock lk{command_write_mutex};
-    const u64 sequence = command_write_sequence.load(std::memory_order_relaxed) + 1;
-    command_writes[sequence % command_log_size] = {gpu_addr, size, sequence};
-    const u64 first = gpu_addr >> command_page_bits;
-    const u64 last = (gpu_addr + size - 1) >> command_page_bits;
-    for (u64 page = first; page <= last; ++page) {
-        command_page_writes[CommandFilterIndex(page)].store(sequence, std::memory_order_relaxed);
+Common::CommandWriteLog::Result MemoryManager::CommandMemoryWrittenSince(GPUVAddr gpu_addr,
+                                                                        std::size_t size,
+                                                                        u64 sequence) {
+    using Result = Common::CommandWriteLog::Result;
+    auto& log = Common::CommandWriteLog::Get();
+    if (log.Sequence() == sequence) {
+        return Result::Unwritten;
     }
-    // Published after the write itself: a snapshot taken at this sequence or later holds it.
-    command_write_sequence.store(sequence, std::memory_order_release);
-}
-
-bool MemoryManager::CommandMemoryWrittenSince(GPUVAddr gpu_addr, std::size_t size,
-                                              u64 sequence) const {
-    if (size == 0 || command_write_sequence.load(std::memory_order_acquire) == sequence) {
-        return false;
-    }
-    const u64 first = gpu_addr >> command_page_bits;
-    const u64 last = (gpu_addr + size - 1) >> command_page_bits;
-    bool touched = false;
-    for (u64 page = first; page <= last && !touched; ++page) {
-        touched = command_page_writes[CommandFilterIndex(page)].load(std::memory_order_relaxed) >
-                  sequence;
-    }
-    if (!touched) {
-        return false;
-    }
-    std::scoped_lock lk{command_write_mutex};
-    const u64 current = command_write_sequence.load(std::memory_order_relaxed);
-    if (current - sequence > command_log_size) {
-        return true;
-    }
-    for (u64 index = sequence + 1; index <= current; ++index) {
-        const CommandMemoryWrite& write = command_writes[index % command_log_size];
-        if (write.addr < gpu_addr + size && gpu_addr < write.addr + write.size) {
-            return true;
+    Result result = Result::Unwritten;
+    ForEachHostRange(gpu_addr, size, [&](const u8* pointer, std::size_t amount) {
+        if (result == Result::Unwritten) {
+            result = log.WrittenSince(pointer, amount, sequence);
         }
-    }
-    return false;
+    });
+    return result;
+}
+
+void MemoryManager::NoteCommandMemoryWrite(GPUVAddr gpu_addr, std::size_t size) {
+    ForEachHostRange(gpu_addr, size, [](const u8* pointer, std::size_t amount) {
+        Common::CommandWriteLog::Get().Note(pointer, amount);
+    });
 }
 
 void MemoryManager::WriteBlock(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which) {

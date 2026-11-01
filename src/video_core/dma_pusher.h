@@ -121,8 +121,8 @@ struct CommandList final {
     /// executed instead of the memory, which the game may already be refilling for a later frame.
     std::vector<CommandHeader> submitted_words;
     std::vector<u32> submitted_offsets;
-    /// MemoryManager::CommandWriteSequence() when the words were copied: entries the GPU wrote
-    /// to since then are read from memory instead.
+    /// Common::CommandWriteLog::Sequence() when the words were copied: entries the GPU wrote to
+    /// since then are read from memory instead.
     u64 submitted_write_sequence{};
 };
 

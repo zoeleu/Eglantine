@@ -158,13 +158,33 @@ bool DmaPusher::Step() {
         // The words as submitted, unless this is a resumed entry, an earlier entry wrote to it
         // since (inline uploads, semaphores), or the GPU has newer ones the safe read below would
         // flush (with the split, the front can't tell: it reads memory unflushed anyway).
-        const bool submitted = command_resume_offset == 0 &&
-                               dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
-                               !memory_manager.CommandMemoryWrittenSince(
-                                   dma_state.dma_get, header.size * sizeof(u32),
-                                   command_list.submitted_write_sequence) &&
-                               !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
-                                                                          header.size * sizeof(u32)));
+        bool submitted = command_resume_offset == 0 &&
+                         dma_pushbuffer_subindex < command_list.submitted_offsets.size();
+        if (submitted) {
+            using WriteResult = Common::CommandWriteLog::Result;
+            const WriteResult written = memory_manager.CommandMemoryWrittenSince(
+                dma_state.dma_get, header.size * sizeof(u32), command_list.submitted_write_sequence);
+            if (written != WriteResult::Unwritten) {
+                // Memory may hold the next frame's words already: count these for testing.
+                static std::atomic<u64> rewritten{};
+                static std::atomic<u64> unknown{};
+                const u64 count = (written == WriteResult::Written ? rewritten : unknown)
+                                      .fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count <= 16 || count % 1000 == 0) {
+                    LOG_INFO(HW_GPU,
+                             "Command entry {:#x} read from memory: {} ({} rewritten, {} past "
+                             "the write log)",
+                             u64{header.addr},
+                             written == WriteResult::Written ? "the GPU wrote to it"
+                                                             : "the write log no longer reaches back",
+                             rewritten.load(std::memory_order_relaxed),
+                             unknown.load(std::memory_order_relaxed));
+                }
+                submitted = false;
+            }
+        }
+        submitted = submitted && !(use_safe && memory_manager.IsMemoryDirty(
+                                                   dma_state.dma_get, header.size * sizeof(u32)));
         if (submitted) {
             const std::span<const CommandHeader> commands{
                 command_list.submitted_words.data() +

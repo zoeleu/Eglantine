@@ -9,6 +9,7 @@
 #include <cstring>
 #include <vector>
 #include "common/assert.h"
+#include "common/command_write_log.h"
 #include "common/logging.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
@@ -455,7 +456,7 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                 memory_manager.MarkCommandMemory(entry.addr, entry.size * sizeof(u32));
             }
             // Before the copy: a GPU write logged later may be missing from it.
-            entries.submitted_write_sequence = memory_manager.CommandWriteSequence();
+            entries.submitted_write_sequence = Common::CommandWriteLog::Get().Sequence();
             entries.submitted_words.resize(words);
             entries.submitted_offsets.reserve(entries.command_lists.size());
             size_t offset = 0;

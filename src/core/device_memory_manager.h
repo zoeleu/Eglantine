@@ -15,6 +15,7 @@
 #include <vector>
 #include <span>
 
+#include "common/command_write_log.h"
 #include "common/common_types.h"
 #include "common/range_mutex.h"
 #include "common/scratch_buffer.h"
@@ -117,6 +118,13 @@ public:
     void ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size);
     void WriteBlock(DAddr address, const void* src_pointer, size_t size);
     void WriteBlockUnsafe(DAddr address, const void* src_pointer, size_t size);
+
+    /// Logs a write made in place, through a span (GuestMemoryScoped).
+    void NoteCommandMemoryWrite(DAddr address, size_t size) {
+        if (const u8* const span = GetSpan(address, size)) {
+            Common::CommandWriteLog::Get().Note(span, size);
+        }
+    }
 
     Asid RegisterProcess(Memory::Memory* memory);
     void UnregisterProcess(Asid id);

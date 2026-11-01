@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <array>
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -14,6 +14,7 @@
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
+#include "common/command_write_log.h"
 #include "common/common_types.h"
 #include "common/multi_level_page_table.h"
 #include "common/range_map.h"
@@ -175,19 +176,18 @@ public:
     const u8* GetSpan(const GPUVAddr src_addr, const std::size_t size) const;
     u8* GetSpan(const GPUVAddr src_addr, const std::size_t size);
 
-    /// NX2 command list snapshots (nvhost_gpu.cpp): marks the pages of submitted command words,
-    /// so the GPU's own writes to them (inline uploads, semaphores) are logged from now on.
+    /// NX2 command list snapshots (nvhost_gpu.cpp): marks the memory of submitted command words in
+    /// Common::CommandWriteLog, so the GPU's own writes to it are logged from now on.
     void MarkCommandMemory(GPUVAddr gpu_addr, std::size_t size);
 
-    /// The last logged write to command memory, to compare against later.
-    [[nodiscard]] u64 CommandWriteSequence() const noexcept {
-        return command_write_sequence.load(std::memory_order_acquire);
-    }
+    /// Whether the GPU wrote to the memory under [gpu_addr, gpu_addr + size) after `sequence`
+    /// (Common::CommandWriteLog::Sequence()), through this or any other mapping of it.
+    [[nodiscard]] Common::CommandWriteLog::Result CommandMemoryWrittenSince(GPUVAddr gpu_addr,
+                                                                          std::size_t size,
+                                                                          u64 sequence);
 
-    /// Whether the GPU wrote to [gpu_addr, gpu_addr + size) after `sequence`. Also true when the
-    /// log no longer reaches back that far.
-    [[nodiscard]] bool CommandMemoryWrittenSince(GPUVAddr gpu_addr, std::size_t size,
-                                                 u64 sequence) const;
+    /// Logs a write made in place, through a span (Core::Memory::GuestMemoryScoped).
+    void NoteCommandMemoryWrite(GPUVAddr gpu_addr, std::size_t size);
 
 private:
     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
@@ -204,26 +204,19 @@ private:
         }
     }
 
-    static constexpr u64 command_page_bits = 12;
-    static constexpr size_t command_filter_size = 1 << 14;
-    static constexpr size_t command_log_size = 256;
-
-    [[nodiscard]] static size_t CommandFilterIndex(u64 page) noexcept {
-        return page & (command_filter_size - 1);
-    }
-
-    /// Logs the write if it touches a page MarkCommandMemory marked (hashed: rarely others too).
-    void NoteCommandMemoryWrite(GPUVAddr gpu_addr, std::size_t size) {
-        const u64 first = gpu_addr >> command_page_bits;
-        const u64 last = (gpu_addr + size - 1) >> command_page_bits;
-        for (u64 page = first; page <= last; ++page) {
-            if (command_pages[CommandFilterIndex(page)].load(std::memory_order_relaxed) != 0) {
-                LogCommandMemoryWrite(gpu_addr, size);
-                return;
+    /// Calls func(host pointer, size) for each mapped CPU page of the range.
+    template <typename Func>
+    void ForEachHostRange(GPUVAddr gpu_addr, std::size_t size, Func&& func) {
+        const GPUVAddr end = gpu_addr + size;
+        while (gpu_addr < end) {
+            const GPUVAddr next =
+                (std::min)((gpu_addr | ((GPUVAddr{1} << cpu_page_bits) - 1)) + 1, end);
+            if (u8* const pointer = GetPointer(gpu_addr)) {
+                func(pointer, static_cast<std::size_t>(next - gpu_addr));
             }
+            gpu_addr = next;
         }
     }
-    void LogCommandMemoryWrite(GPUVAddr gpu_addr, std::size_t size);
 
     inline bool IsBigPageContinuous(size_t big_page_index) const;
     inline void SetBigPageContinuous(size_t big_page_index, bool value);
@@ -285,18 +278,6 @@ private:
     VideoCommon::InvalidationAccumulator accumulator;
 
     static std::atomic<size_t> unique_identifier_generator;
-
-    struct CommandMemoryWrite {
-        GPUVAddr addr;
-        u64 size;
-        u64 sequence;
-    };
-    std::array<std::atomic<u8>, command_filter_size> command_pages{};
-    /// Per filter slot, the sequence of the last logged write to it (0: none).
-    std::array<std::atomic<u64>, command_filter_size> command_page_writes{};
-    std::array<CommandMemoryWrite, command_log_size> command_writes{};
-    std::atomic<u64> command_write_sequence{};
-    mutable std::mutex command_write_mutex;
 
     Common::ScratchBuffer<u8> tmp_buffer;
 };
