@@ -794,7 +794,7 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 }
 
 void HostMemory::HintCold(size_t physical_offset, size_t length,
-                          std::optional<size_t> virtual_offset) {
+                          std::optional<size_t> virtual_offset) const {
     if (length == 0 || backing_base == nullptr) {
         return;
     }
