@@ -450,12 +450,18 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             for (const auto& entry : entries.command_lists) {
                 words += entry.size;
             }
+            auto& memory_manager = *channel_state->memory_manager;
+            for (const auto& entry : entries.command_lists) {
+                memory_manager.MarkCommandMemory(entry.addr, entry.size * sizeof(u32));
+            }
+            // Before the copy: a GPU write logged later may be missing from it.
+            entries.submitted_write_sequence = memory_manager.CommandWriteSequence();
             entries.submitted_words.resize(words);
             entries.submitted_offsets.reserve(entries.command_lists.size());
             size_t offset = 0;
             for (const auto& entry : entries.command_lists) {
                 entries.submitted_offsets.push_back(static_cast<u32>(offset));
-                channel_state->memory_manager->ReadBlockUnsafe(
+                memory_manager.ReadBlockUnsafe(
                     entry.addr, entries.submitted_words.data() + offset, entry.size * sizeof(u32));
                 offset += entry.size;
             }

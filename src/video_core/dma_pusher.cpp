@@ -155,11 +155,14 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
-        // safe read below would flush (with the split, the front can't tell: it reads memory
-        // unflushed anyway).
+        // The words as submitted, unless this is a resumed entry, an earlier entry wrote to it
+        // since (inline uploads, semaphores), or the GPU has newer ones the safe read below would
+        // flush (with the split, the front can't tell: it reads memory unflushed anyway).
         const bool submitted = command_resume_offset == 0 &&
                                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+                               !memory_manager.CommandMemoryWrittenSince(
+                                   dma_state.dma_get, header.size * sizeof(u32),
+                                   command_list.submitted_write_sequence) &&
                                !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
                                                                           header.size * sizeof(u32)));
         if (submitted) {

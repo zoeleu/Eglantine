@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -174,6 +175,20 @@ public:
     const u8* GetSpan(const GPUVAddr src_addr, const std::size_t size) const;
     u8* GetSpan(const GPUVAddr src_addr, const std::size_t size);
 
+    /// NX2 command list snapshots (nvhost_gpu.cpp): marks the pages of submitted command words,
+    /// so the GPU's own writes to them (inline uploads, semaphores) are logged from now on.
+    void MarkCommandMemory(GPUVAddr gpu_addr, std::size_t size);
+
+    /// The last logged write to command memory, to compare against later.
+    [[nodiscard]] u64 CommandWriteSequence() const noexcept {
+        return command_write_sequence.load(std::memory_order_acquire);
+    }
+
+    /// Whether the GPU wrote to [gpu_addr, gpu_addr + size) after `sequence`. Also true when the
+    /// log no longer reaches back that far.
+    [[nodiscard]] bool CommandMemoryWrittenSince(GPUVAddr gpu_addr, std::size_t size,
+                                                 u64 sequence) const;
+
 private:
     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
@@ -188,6 +203,27 @@ private:
             return (gpu_addr >> page_bits) & page_table_mask;
         }
     }
+
+    static constexpr u64 command_page_bits = 12;
+    static constexpr size_t command_filter_size = 1 << 14;
+    static constexpr size_t command_log_size = 256;
+
+    [[nodiscard]] static size_t CommandFilterIndex(u64 page) noexcept {
+        return page & (command_filter_size - 1);
+    }
+
+    /// Logs the write if it touches a page MarkCommandMemory marked (hashed: rarely others too).
+    void NoteCommandMemoryWrite(GPUVAddr gpu_addr, std::size_t size) {
+        const u64 first = gpu_addr >> command_page_bits;
+        const u64 last = (gpu_addr + size - 1) >> command_page_bits;
+        for (u64 page = first; page <= last; ++page) {
+            if (command_pages[CommandFilterIndex(page)].load(std::memory_order_relaxed) != 0) {
+                LogCommandMemoryWrite(gpu_addr, size);
+                return;
+            }
+        }
+    }
+    void LogCommandMemoryWrite(GPUVAddr gpu_addr, std::size_t size);
 
     inline bool IsBigPageContinuous(size_t big_page_index) const;
     inline void SetBigPageContinuous(size_t big_page_index, bool value);
@@ -249,6 +285,18 @@ private:
     VideoCommon::InvalidationAccumulator accumulator;
 
     static std::atomic<size_t> unique_identifier_generator;
+
+    struct CommandMemoryWrite {
+        GPUVAddr addr;
+        u64 size;
+        u64 sequence;
+    };
+    std::array<std::atomic<u8>, command_filter_size> command_pages{};
+    /// Per filter slot, the sequence of the last logged write to it (0: none).
+    std::array<std::atomic<u64>, command_filter_size> command_page_writes{};
+    std::array<CommandMemoryWrite, command_log_size> command_writes{};
+    std::atomic<u64> command_write_sequence{};
+    mutable std::mutex command_write_mutex;
 
     Common::ScratchBuffer<u8> tmp_buffer;
 };
