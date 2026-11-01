@@ -332,6 +332,10 @@ GraphicsPipeline::GraphicsPipeline(
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
         }
+        // Nothing reads the shader modules once the pipeline exists, and the driver keeps a copy
+        // of each one's SPIR-V while it lives (title 1: ~1,500 pipelines, 2-5 modules each).
+        // Shader reuse keeps its own reference to the modules it can hand out again.
+        spv_modules.reset();
 
         std::scoped_lock lock{build_mutex};
         is_built = true;
@@ -340,12 +344,13 @@ GraphicsPipeline::GraphicsPipeline(
             shader_notify->MarkShaderComplete();
         }
     }};
+    // Before the build: it frees the modules this looks at.
+    configure_func = ConfigureFunc(*spv_modules, stage_infos);
     if (worker_thread) {
         worker_thread->QueueWork(std::move(func));
     } else {
         func();
     }
-    configure_func = ConfigureFunc(*spv_modules, stage_infos);
 }
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
