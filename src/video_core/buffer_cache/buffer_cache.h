@@ -16,6 +16,7 @@
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/guest_memory.h"
+#include "video_core/nx2_draw_cache.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/texture_cache/util.h"
@@ -814,8 +815,12 @@ void BufferCache<P>::BindHostIndexBuffer() {
     const u32 size = channel_state->index_buffer.size;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     if (draw_state.inline_index_draw_indexes.empty()) {
-        SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
+        SynchronizeBinding(channel_state->synced_index_buffer, buffer,
+                           channel_state->index_buffer.buffer_id,
+                           channel_state->index_buffer.device_addr, size);
     } else {
+        // The inline indices overwrite the buffer without the tracker knowing.
+        channel_state->synced_index_buffer = {};
         if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
             auto upload_staging = runtime.UploadStagingBuffer(size);
             std::array<BufferCopy, 1> copies{{BufferCopy{.src_offset = upload_staging.offset, .dst_offset = 0, .size = size}}};
@@ -899,7 +904,8 @@ void BufferCache<P>::BindHostVertexBuffers() {
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
-            SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            SynchronizeBinding(channel_state->synced_vertex_buffers[index], buffer,
+                               binding.buffer_id, binding.device_addr, binding.size);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
                 continue;
@@ -1152,7 +1158,8 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
-        SynchronizeBuffer(buffer, binding.device_addr, size);
+        SynchronizeBinding(channel_state->synced_storage_buffers[stage][index], buffer,
+                           binding.buffer_id, binding.device_addr, size);
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
@@ -1787,6 +1794,7 @@ void BufferCache<P>::Unregister(BufferId buffer_id) {
 template <class P>
 template <bool insert>
 void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
+    ++buffers_generation;
     Buffer& buffer = slot_buffers[buffer_id];
     const auto size = buffer.SizeBytes();
     if (insert) {
@@ -1878,6 +1886,26 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
         return false;
     }
+}
+
+template <class P>
+void BufferCache<P>::SynchronizeBinding(SyncedBinding& synced, Buffer& buffer, BufferId buffer_id,
+                                        DAddr device_addr, u32 size) {
+    if (g_draw_cache && synced.buffer_id == buffer_id && synced.device_addr == device_addr &&
+        synced.size == size && synced.buffers_generation == buffers_generation &&
+        !memory_tracker.CpuMarkedSince(device_addr, size, synced.mark_sequence)) {
+        return;
+    }
+    // Read before: a mark during the upload (none are expected) still shows up next time.
+    const u64 mark_sequence = memory_tracker.CpuMarkSequence();
+    SynchronizeBuffer(buffer, device_addr, size);
+    synced = {
+        .buffer_id = buffer_id,
+        .device_addr = device_addr,
+        .size = size,
+        .buffers_generation = buffers_generation,
+        .mark_sequence = mark_sequence,
+    };
 }
 
 template <class P>
