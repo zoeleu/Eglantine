@@ -3174,6 +3174,9 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// GPU split back thread: a run of constant buffer data words a front macro wrote
+    /// (GpuSplit::MacroDataWord), each bits 0-15 method, 32-63 argument.
+    void ProcessMacroDataRun(Core::System& system, const u64* words, size_t count);
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3316,10 +3319,11 @@ private:
         u32 amount;
         u32 pending;
     };
-    std::array<RecentWrite, 48> recent_writes{};
+    std::array<RecentWrite, 64> recent_writes{}; // Power of two: the index wraps with a mask
     size_t recent_write_index = 0;
     void RecordWrite(u32 method, u32 argument, u32 amount, u32 pending) {
-        recent_writes[recent_write_index++ % recent_writes.size()] = {method, argument, amount, pending};
+        recent_writes[recent_write_index++ & (recent_writes.size() - 1)] = {method, argument, amount,
+                                                                            pending};
     }
     void DumpRecentWrites(u32 method);
     /// Parameters that have been submitted to the macro call so far.
@@ -3345,7 +3349,7 @@ private:
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
-    void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontVerify(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;
     bool front_macros{};

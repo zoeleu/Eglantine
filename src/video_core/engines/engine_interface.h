@@ -47,6 +47,8 @@ public:
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;
     bool current_dirty{};
+    /// Set by Maxwell3D: the GPU split's back thread calls it without the virtual call.
+    bool is_maxwell_3d{};
 protected:
     virtual void ConsumeSinkImpl(Core::System& system) {
         for (auto [method, value] : method_sink) {

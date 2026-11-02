@@ -105,11 +105,19 @@ bool DmaPusher::Step() {
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
-            const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart;
+            auto& split = VideoCommon::GpuSplit::Get();
+            // With native macros on the split's front, the back never runs a Maxwell3D macro,
+            // the only reader of its current_dirty.
+            const bool macro_payload =
+                engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart &&
+                !(split.Active() && split.FrontMacros() &&
+                  static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel])
+                      ->GetNativeMacroEngine()
+                      .native_turing);
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
-                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                if (split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {

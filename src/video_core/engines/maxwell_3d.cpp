@@ -45,6 +45,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
 {
     dirty.flags.flip();
     InitializeRegisterDefaults();
+    is_maxwell_3d = true;
     execution_mask.reset();
     for (size_t i = 0; i < execution_mask.size(); i++)
         execution_mask[i] = IsMethodExecutable(u32(i));
@@ -746,6 +747,21 @@ void Maxwell3D::ProcessCBData(u32 value) {
     ProcessCBMultiData(&value, 1);
 }
 
+void Maxwell3D::ProcessMacroDataRun(Core::System& system, const u64* words, size_t count) {
+    // What CallMethod does for each word (shadow RAM, register, dirty flags, ProcessCBData),
+    // with one memory write for the run: the words land at consecutive offsets either way.
+    ConsumeSink(system);
+    std::array<u32, 256> values;
+    ASSERT(count <= values.size());
+    for (size_t i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>(words[i] & 0xffff);
+        const u32 value = ProcessShadowRam(method, static_cast<u32>(words[i] >> 32));
+        ProcessDirtyRegisters(method, value);
+        values[i] = value;
+    }
+    ProcessCBMultiData(values.data(), static_cast<u32>(count));
+}
+
 void Maxwell3D::ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount) {
     if (amount == 0) {
         return;
@@ -854,6 +870,25 @@ bool FrontSkipSame() {
     return skip;
 }
 
+// EDEN_NX2_SPLIT_CB_RUN=0: send each constant buffer data word a front macro writes on its own.
+bool FrontMacroDataRuns() {
+    static const bool runs = [] {
+        const char* value = std::getenv("EDEN_NX2_SPLIT_CB_RUN");
+        return value == nullptr || value[0] != '0';
+    }();
+    return runs;
+}
+
+// EDEN_NX2_SPLIT_BATCH=0: send macro state writes as direct calls instead of through the back's
+// method sink.
+bool FrontBatchStateWrites() {
+    static const bool batch = [] {
+        const char* value = std::getenv("EDEN_NX2_SPLIT_BATCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return batch;
+}
+
 } // Anonymous namespace
 
 Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSplit& split) {
@@ -943,10 +978,16 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             break;
         }
     }
-    if (from_macro) {
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    if (from_macro && method >= cb_data && method < cb_data + 16 && FrontMacroDataRuns()) {
+        split.MacroDataWord(this, method, argument);
+    } else if (from_macro && (execution_mask[method] || !FrontBatchStateWrites())) {
         split.MacroWrite(this, method, argument);
     } else {
-        split.Method(this, method, argument, is_last_call, nullptr);
+        // A macro's state write goes to the back's method sink like a command list's: the back
+        // applies it with the rest of the sink (as CallMethod would) before the next executable
+        // method or FinishFrontMacro, without a call per write.
+        split.Method(this, method, argument, is_last_call || from_macro, nullptr);
     }
 }
 
@@ -1097,7 +1138,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); });
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
-        FrontVerify(split, fs);
+        FrontVerify(system, split, fs);
     }
 #else
     fs.executing_macro = 0;
@@ -1141,19 +1182,16 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
 }
 
-void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
+void Maxwell3D::FrontVerify(Core::System& system, VideoCommon::GpuSplit& split, FrontState& fs) {
     split.Drain();
+    // State writes the back still holds in its method sink (and their shadow RAM updates) count
+    // as done: apply them while the back is idle, as Front() does.
+    ConsumeSink(system);
     static u64 checks{};
     static u64 differences{};
     ++checks;
-    // State writes the back still holds in its method sink count as done.
     std::array<u32, Regs::NUM_REGS> expected;
     std::memcpy(expected.data(), regs.reg_array.data(), sizeof(expected));
-    for (const auto& [method, value] : method_sink) {
-        expected[method] = shadow_state.shadow_ram_control == Regs::ShadowRamControl::Replay
-                               ? shadow_state.reg_array[method]
-                               : value;
-    }
     static u64 control_differences{};
     if ((fs.control != shadow_state.shadow_ram_control ||
          fs.shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] != shadow_state.reg_array[MAXWELL3D_REG_INDEX(shadow_ram_control)] ||
