@@ -42,6 +42,17 @@ void Pause() {
 #endif
 }
 
+// Ring lines the front just wrote are in its core's cache: ask for the next ones early.
+void Prefetch(const void* address) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+#elif defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(address);
+#else
+    (void)address;
+#endif
+}
+
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 std::atomic<bool> g_back_busy{};
 
@@ -356,9 +367,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #endif
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
-        Nx2Profile::Report("GPU back thread");
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
+            Nx2Profile::Report("GPU back thread");
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position; ++spins) {
@@ -385,6 +396,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         Nx2Profile::Scope batch_scope{Nx2Profile::Zone::Method};
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            Prefetch(&ring[(read_position + 64) & RingMask]);
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
             // Hand ring space back now and then while working through a long batch.
