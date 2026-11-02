@@ -71,7 +71,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 if (!state.queue.TryPop(next)) {
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond before sleeping, or every wait also waits out a host sleep
-                    // (title 1 waits ~25 times a second).
+                    // (title 1 waits ~25 times a second). A split's back thread still running
+                    // counts as progress: the release or a deferred acquire check may be there.
+                    if (split.Active() && !split.Idle()) {
+                        last_progress = std::chrono::steady_clock::now();
+                    }
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     if (std::chrono::steady_clock::now() - last_progress <
                         std::chrono::microseconds{500}) {
