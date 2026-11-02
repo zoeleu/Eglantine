@@ -160,6 +160,9 @@ private:
 
     void FlushWork();
 
+    /// Draw-time debug traces; true when the draw is to be skipped (EDEN_NX2_SKIP_VS).
+    bool DebugDraw(bool is_indexed);
+
     /// `pipeline`: the draw's pipeline, for dynamic vertex input (null: looked up).
     void UpdateDynamicStates(GraphicsPipeline* pipeline);
 
