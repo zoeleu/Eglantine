@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -56,6 +57,7 @@ public:
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
                 const GPUVAddr* segment) {
+        FlushRun();
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
@@ -71,11 +73,22 @@ public:
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        FlushRun();
         SelectEngine(engine);
         u64* const entry = Reserve(1);
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
+    }
+    /// Constant buffer data written by a Maxwell3D front macro (const_buffer.buffer): words in a
+    /// row go to the back as one run, which writes them to memory at once. Any other entry, a
+    /// publish or a drain ends the run first.
+    void MacroDataWord(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        if (run_count != 0 && (run_engine != engine || run_count == run_words.size())) {
+            FlushRun();
+        }
+        run_engine = engine;
+        run_words[run_count++] = u64{method & 0xffff} | (u64{argument} << 32);
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
@@ -83,6 +96,7 @@ public:
     void Defer(const Func& func) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        FlushRun();
         u64* const entry = Reserve(2 + payload);
         entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
@@ -108,6 +122,7 @@ private:
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        Run,    ///< Bits 8-31 count; then per word bits 0-15 method, 32-63 argument (MacroDataWord)
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
@@ -140,6 +155,12 @@ private:
         }
     }
     void WaitForSpace(size_t words);
+    void FlushRun() {
+        if (run_count != 0) {
+            FlushRunSlow();
+        }
+    }
+    void FlushRunSlow();
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         if (engine != front_engine) [[unlikely]] {
             SwitchEngine(engine);
@@ -164,6 +185,10 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    /// MacroDataWord's words not sent yet.
+    std::array<u64, 256> run_words{};
+    size_t run_count{};
+    Tegra::Engines::EngineInterface* run_engine{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};

@@ -3174,6 +3174,9 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// GPU split back thread: a run of constant buffer data words a front macro wrote
+    /// (GpuSplit::MacroDataWord), each bits 0-15 method, 32-63 argument.
+    void ProcessMacroDataRun(Core::System& system, const u64* words, size_t count);
 
     bool ShouldExecute() const {
         return execute_on;

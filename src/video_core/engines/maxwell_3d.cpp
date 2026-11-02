@@ -747,6 +747,21 @@ void Maxwell3D::ProcessCBData(u32 value) {
     ProcessCBMultiData(&value, 1);
 }
 
+void Maxwell3D::ProcessMacroDataRun(Core::System& system, const u64* words, size_t count) {
+    // What CallMethod does for each word (shadow RAM, register, dirty flags, ProcessCBData),
+    // with one memory write for the run: the words land at consecutive offsets either way.
+    ConsumeSink(system);
+    std::array<u32, 256> values;
+    ASSERT(count <= values.size());
+    for (size_t i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>(words[i] & 0xffff);
+        const u32 value = ProcessShadowRam(method, static_cast<u32>(words[i] >> 32));
+        ProcessDirtyRegisters(method, value);
+        values[i] = value;
+    }
+    ProcessCBMultiData(values.data(), static_cast<u32>(count));
+}
+
 void Maxwell3D::ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount) {
     if (amount == 0) {
         return;
@@ -855,6 +870,15 @@ bool FrontSkipSame() {
     return skip;
 }
 
+// EDEN_NX2_SPLIT_CB_RUN=0: send each constant buffer data word a front macro writes on its own.
+bool FrontMacroDataRuns() {
+    static const bool runs = [] {
+        const char* value = std::getenv("EDEN_NX2_SPLIT_CB_RUN");
+        return value == nullptr || value[0] != '0';
+    }();
+    return runs;
+}
+
 // EDEN_NX2_SPLIT_BATCH=0: send macro state writes as direct calls instead of through the back's
 // method sink.
 bool FrontBatchStateWrites() {
@@ -954,7 +978,10 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             break;
         }
     }
-    if (from_macro && (execution_mask[method] || !FrontBatchStateWrites())) {
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    if (from_macro && method >= cb_data && method < cb_data + 16 && FrontMacroDataRuns()) {
+        split.MacroDataWord(this, method, argument);
+    } else if (from_macro && (execution_mask[method] || !FrontBatchStateWrites())) {
         split.MacroWrite(this, method, argument);
     } else {
         // A macro's state write goes to the back's method sink like a command list's: the back

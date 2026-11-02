@@ -143,6 +143,8 @@ void GpuSplit::Stop() {
     consumed_cache = 0;
     publish_every = PublishEvery;
     front_engine = nullptr;
+    run_count = 0;
+    run_engine = nullptr;
     back_engine = nullptr;
     back_maxwell_3d = nullptr;
     front_macros = false;
@@ -185,6 +187,7 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    FlushRun();
     if (published_local == write_position) {
         return;
     }
@@ -198,6 +201,7 @@ void GpuSplit::Publish() {
 }
 
 void GpuSplit::Drain() {
+    FlushRun();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
         return;
@@ -228,6 +232,7 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                            u32 amount, u32 methods_pending, const GPUVAddr* segment) {
+    FlushRun();
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
@@ -249,6 +254,16 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         amount -= piece;
         methods_pending -= piece;
     }
+}
+
+void GpuSplit::FlushRunSlow() {
+    const size_t count = run_count;
+    run_count = 0; // Before the entry: Commit may publish, which flushes the run
+    SelectEngine(run_engine);
+    u64* const entry = Reserve(1 + count);
+    entry[0] = static_cast<u64>(Kind::Run) | (u64{count} << 8);
+    std::memcpy(entry + 1, run_words.data(), count * sizeof(u64));
+    Commit(1 + count);
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
@@ -315,6 +330,12 @@ size_t GpuSplit::Execute(const u64* entry) {
             engine->CallMultiMethod(*system, method, words, amount, pending);
         }
         return data + (amount + 1) / 2;
+    }
+    case Kind::Run: {
+        // Only Maxwell3D sends runs (Maxwell3D::FrontWrite).
+        const size_t count = static_cast<size_t>((head >> 8) & 0xffffff);
+        back_maxwell_3d->ProcessMacroDataRun(*system, entry + 1, count);
+        return 1 + count;
     }
     case Kind::Call: {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
