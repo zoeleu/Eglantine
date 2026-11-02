@@ -11,13 +11,10 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/engines/engine_interface.h"
 
 namespace Core {
 class System;
-}
-
-namespace Tegra::Engines {
-class EngineInterface;
 }
 
 namespace VideoCommon {
@@ -104,6 +101,9 @@ public:
         consumed_cache = consumed.load(std::memory_order_acquire);
         return consumed_cache == write_position;
     }
+    /// Waits until the back executed every entry sent so far that can write memory or caches
+    /// (executable methods, multi-word methods, deferred calls); the rest only set registers.
+    void WaitForEffects();
 
 private:
     enum class Kind : u64 {
@@ -138,12 +138,32 @@ private:
     }
     u64* ReserveSlow(size_t words);
     void Commit(size_t words) {
+        NoteEffect(write_position & RingMask);
         write_position += words;
+        if (effect_pending) {
+            effect_pending = false;
+            last_effect_end = write_position;
+        }
         if (write_position - published_local >= publish_every) {
             Publish();
         }
     }
     void WaitForSpace(size_t words);
+    void NoteEffect(size_t index) {
+        const u64 head = ring[index];
+        switch (static_cast<Kind>(head & 0xf)) {
+        case Kind::Method:
+            effect_pending = front_engine != nullptr &&
+                             front_engine->execution_mask[static_cast<size_t>((head >> 8) & 0xffff)];
+            break;
+        case Kind::Multi:
+        case Kind::Call:
+            effect_pending = true;
+            break;
+        default:
+            break;
+        }
+    }
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         if (engine != front_engine) [[unlikely]] {
             SwitchEngine(engine);
@@ -166,6 +186,8 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    u64 last_effect_end{}; ///< End of the last entry WaitForEffects waits for
+    bool effect_pending{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
@@ -174,6 +196,7 @@ private:
 
     alignas(64) std::atomic<u64> published{};
     alignas(64) std::atomic<u64> consumed{};
+    std::atomic<u64> wait_target{}; ///< WaitForEffects: the back stores `consumed` once past it
     alignas(64) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
     std::jthread back_thread;
