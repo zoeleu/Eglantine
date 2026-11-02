@@ -15,6 +15,7 @@
 #include <queue>
 
 #include "common/bit_field.h"
+#include "common/command_write_log.h"
 #include "common/common_types.h"
 #include "common/scratch_buffer.h"
 #include "video_core/engines/engine_interface.h"
@@ -124,6 +125,8 @@ struct CommandList final {
     /// Common::CommandWriteLog::Sequence() when the words were copied: entries the GPU wrote to
     /// since then are read from memory instead.
     u64 submitted_write_sequence{};
+    /// Keeps GPU writes to the entries' memory logged until the list has run.
+    Common::CommandWriteLog::Marks submitted_marks;
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).

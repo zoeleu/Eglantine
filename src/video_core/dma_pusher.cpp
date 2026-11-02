@@ -165,22 +165,24 @@ bool DmaPusher::Step() {
             const WriteResult written = memory_manager.CommandMemoryWrittenSince(
                 dma_state.dma_get, header.size * sizeof(u32), command_list.submitted_write_sequence);
             if (written != WriteResult::Unwritten) {
-                // Memory may hold the next frame's words already: count these for testing.
+                // Rewritten: memory holds the GPU's words (and maybe the next frame's). Past the
+                // log: no write was seen, and memory is likelier stale than the copy, so keep it.
                 static std::atomic<u64> rewritten{};
                 static std::atomic<u64> unknown{};
                 const u64 count = (written == WriteResult::Written ? rewritten : unknown)
                                       .fetch_add(1, std::memory_order_relaxed) + 1;
                 if (count <= 16 || count % 1000 == 0) {
                     LOG_INFO(HW_GPU,
-                             "Command entry {:#x} read from memory: {} ({} rewritten, {} past "
-                             "the write log)",
+                             "Command entry {:#x}: {} ({} read from memory, {} past the write "
+                             "log kept the copy)",
                              u64{header.addr},
-                             written == WriteResult::Written ? "the GPU wrote to it"
-                                                             : "the write log no longer reaches back",
+                             written == WriteResult::Written
+                                 ? "the GPU wrote to it, read from memory"
+                                 : "the write log no longer reaches back, kept the copy",
                              rewritten.load(std::memory_order_relaxed),
                              unknown.load(std::memory_order_relaxed));
                 }
-                submitted = false;
+                submitted = written != WriteResult::Written;
             }
         }
         submitted = submitted && !(use_safe && memory_manager.IsMemoryDirty(

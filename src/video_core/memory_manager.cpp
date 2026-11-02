@@ -505,10 +505,10 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     MemoryOperation(gpu_dest_addr, size, true, mapped_big, just_advance, write_short_pages);
 }
 
-void MemoryManager::MarkCommandMemory(GPUVAddr gpu_addr, std::size_t size) {
-    ForEachHostRange(gpu_addr, size, [](const u8* pointer, std::size_t amount) {
-        Common::CommandWriteLog::Get().Mark(pointer, amount);
-    });
+void MemoryManager::MarkCommandMemory(GPUVAddr gpu_addr, std::size_t size,
+                                      Common::CommandWriteLog::Marks& marks) {
+    ForEachHostRange(gpu_addr, size,
+                     [&](const u8* pointer, std::size_t amount) { marks.Add(pointer, amount); });
 }
 
 Common::CommandWriteLog::Result MemoryManager::CommandMemoryWrittenSince(GPUVAddr gpu_addr,

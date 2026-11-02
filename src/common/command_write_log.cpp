@@ -10,14 +10,31 @@ CommandWriteLog& CommandWriteLog::Get() {
     return instance;
 }
 
-void CommandWriteLog::Mark(const u8* pointer, std::size_t size) {
+void CommandWriteLog::Marks::Add(const u8* pointer, std::size_t size) {
     if (size == 0) {
         return;
     }
+    Get().Mark(pointer, size, true);
+    ranges.emplace_back(pointer, size);
+}
+
+void CommandWriteLog::Marks::Release() {
+    for (const auto& [pointer, size] : ranges) {
+        Get().Mark(pointer, size, false);
+    }
+    ranges.clear();
+}
+
+void CommandWriteLog::Mark(const u8* pointer, std::size_t size, bool add) {
     const u64 first = Page(pointer);
     const u64 last = Page(pointer + size - 1);
     for (u64 page = first; page <= last; ++page) {
-        marked[FilterIndex(page)].store(1, std::memory_order_relaxed);
+        auto& count = marks[FilterIndex(page)];
+        if (add) {
+            count.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            count.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
 }
 

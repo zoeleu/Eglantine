@@ -453,7 +453,8 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             }
             auto& memory_manager = *channel_state->memory_manager;
             for (const auto& entry : entries.command_lists) {
-                memory_manager.MarkCommandMemory(entry.addr, entry.size * sizeof(u32));
+                memory_manager.MarkCommandMemory(entry.addr, entry.size * sizeof(u32),
+                                                 entries.submitted_marks);
             }
             // Before the copy: a GPU write logged later may be missing from it.
             entries.submitted_write_sequence = Common::CommandWriteLog::Get().Sequence();

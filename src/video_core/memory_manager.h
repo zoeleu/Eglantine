@@ -177,8 +177,9 @@ public:
     u8* GetSpan(const GPUVAddr src_addr, const std::size_t size);
 
     /// NX2 command list snapshots (nvhost_gpu.cpp): marks the memory of submitted command words in
-    /// Common::CommandWriteLog, so the GPU's own writes to it are logged from now on.
-    void MarkCommandMemory(GPUVAddr gpu_addr, std::size_t size);
+    /// Common::CommandWriteLog, so the GPU's own writes to it are logged until `marks` is released.
+    void MarkCommandMemory(GPUVAddr gpu_addr, std::size_t size,
+                           Common::CommandWriteLog::Marks& marks);
 
     /// Whether the GPU wrote to the memory under [gpu_addr, gpu_addr + size) after `sequence`
     /// (Common::CommandWriteLog::Sequence()), through this or any other mapping of it.
