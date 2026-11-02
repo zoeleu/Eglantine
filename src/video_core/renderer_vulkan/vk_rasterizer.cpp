@@ -258,6 +258,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     {
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
+    }
+    {
+        Profile::Scope scope{Profile::Zone::FlushCaching};
         gpu_memory->FlushCaching();
     }
 
@@ -1361,10 +1364,13 @@ void RasterizerVulkan::FlushWork() {
     if ((++draw_counter & CHECK_MASK) != CHECK_MASK) {
         return;
     }
+    namespace Profile = VideoCommon::Nx2Profile;
     if (draw_counter < DRAWS_TO_DISPATCH) {
+        Profile::Scope scope{Profile::Zone::DispatchWork};
         scheduler.DispatchWork();
         return;
     }
+    Profile::Scope scope{Profile::Zone::SchedulerFlush};
     scheduler.Flush();
     draw_counter = 0;
 }
