@@ -38,7 +38,7 @@ public:
 
     [[nodiscard]] std::pair<T, bool> Read(Tegra::MemoryManager const& gpu_memory, u32 index) noexcept {
         DEBUG_ASSERT(index <= current_limit);
-        if (invalidated) [[unlikely]] {
+        if (invalidated) {
             std::ranges::fill(read_descriptors, 0);
             invalidated = false;
         }

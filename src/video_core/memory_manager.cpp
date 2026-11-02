@@ -440,7 +440,7 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
         // written, while its backing is pending): the per-page copy handles that.
         u8* const physical = IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr_base)
                                                              : nullptr;
-        if (physical != nullptr) [[likely]] {
+        if (physical != nullptr) {
             std::memcpy(dest_buffer, physical, copy_amount);
         } else {
             memory.ReadBlockUnsafe(dev_addr_base, dest_buffer, copy_amount);
@@ -496,7 +496,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         }
         u8* const physical = IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr_base)
                                                              : nullptr;
-        if (physical != nullptr) [[likely]] {
+        if (physical != nullptr) {
             std::memcpy(physical, src_buffer, copy_amount);
             Common::CommandWriteLog::Get().Note(physical, copy_amount);
         } else {
