@@ -74,6 +74,13 @@ struct OverlapResult {
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output);
 
+/// Unswizzles only the blocks of a 2D block-linear image that overlap `dirty_ranges` (sorted,
+/// non-overlapping [begin, end) byte offsets from the image start) into `output`. Returns no copies
+/// when the image layout is not one this handles; the caller then uploads the whole image.
+[[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImageRows(
+    Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+    std::span<const std::pair<u64, u64>> dirty_ranges, std::vector<u8>& output);
+
 /// For a single-layer 2D block-linear image of 1x1-texel blocks: the host sparse blocks
 /// (tile_width x tile_height texels) that the guest byte ranges (offset, size) touch, merged into
 /// runs along x. Levels from tail_level on (the host's mip tail) come whole.
