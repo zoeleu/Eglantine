@@ -29,6 +29,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+#include "video_core/nx2_draw_cache.h"
 #include "video_core/nx2_profile.h"
 
 #if defined(__clang__) && defined(NDEBUG)
@@ -381,26 +382,44 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+        // Each handle read walked the page tables (MemoryManager::Read); resolve each constant
+        // buffer the stage reads handles from to host memory once instead, when contiguous.
+        std::array<const u8*, Maxwell::MaxConstBuffers> cbuf_spans{};
+        std::array<bool, Maxwell::MaxConstBuffers> cbuf_resolved{};
+        const auto read_word{[&](u32 cbuf_index, u32 offset) -> u32 {
+            const auto& cbuf = cbufs[cbuf_index];
+            if (VideoCommon::g_draw_cache && offset + sizeof(u32) <= cbuf.size) {
+                if (!cbuf_resolved[cbuf_index]) {
+                    cbuf_resolved[cbuf_index] = true;
+                    if (!gpu_memory->OverlapsSyncpointShim(cbuf.address, cbuf.size)) {
+                        cbuf_spans[cbuf_index] = gpu_memory->GetSpan(cbuf.address, cbuf.size);
+                    }
+                }
+                if (const u8* const span = cbuf_spans[cbuf_index]) {
+                    u32 value;
+                    std::memcpy(&value, span + offset, sizeof(value));
+                    return value;
+                }
+            }
+            return gpu_memory->Read<u32>(cbuf.address + offset);
+        }};
         const auto read_handle{[&](const auto& desc, u32 index) {
             ASSERT(cbufs[desc.cbuf_index].enabled);
             const u32 index_offset{index << desc.size_shift};
             const u32 offset{desc.cbuf_offset + index_offset};
-            const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
             if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
                           std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
                 if (desc.has_secondary) {
                     ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
                     const u32 second_offset{desc.secondary_cbuf_offset + index_offset};
-                    const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
-                                                 second_offset};
-                    const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
+                    const u32 lhs_raw{read_word(desc.cbuf_index, offset) << desc.shift_left};
+                    const u32 rhs_raw{read_word(desc.secondary_cbuf_index, second_offset)
                                       << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
                     return TexturePair(raw, via_header_index);
                 }
             }
-            return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
+            return TexturePair(read_word(desc.cbuf_index, offset), via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {

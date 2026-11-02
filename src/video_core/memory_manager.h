@@ -64,6 +64,13 @@ public:
         return unique_identifier;
     }
 
+    /// Whether reads in [addr, addr + size) may hit the native syncpoint shim (Read<u32> answers
+    /// those from the syncpoint manager instead of memory).
+    [[nodiscard]] bool OverlapsSyncpointShim(GPUVAddr addr, std::size_t size) const noexcept {
+        const GPUVAddr shim = native_syncpoint_shim.load(std::memory_order_acquire);
+        return shim != 0 && addr < shim + NumShimSyncpoints * sizeof(u32) && shim < addr + size;
+    }
+
     /// Bumped on every map, sparse map and unmap: translations cached under an older value may
     /// be stale.
     [[nodiscard]] u64 MapGeneration() const noexcept {
