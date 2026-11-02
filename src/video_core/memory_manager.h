@@ -64,6 +64,12 @@ public:
         return unique_identifier;
     }
 
+    /// Bumped on every map, sparse map and unmap: translations cached under an older value may
+    /// be stale.
+    [[nodiscard]] u64 MapGeneration() const noexcept {
+        return map_generation.load(std::memory_order_acquire);
+    }
+
     /// Binds a renderer to the memory manager.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
@@ -228,6 +234,7 @@ private:
         boost::container::small_vector<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result) const;
 
     std::atomic<GPUVAddr> native_syncpoint_shim{};
+    std::atomic<u64> map_generation{};
     Core::System& system;
     MaxwellDeviceMemoryManager& memory;
 

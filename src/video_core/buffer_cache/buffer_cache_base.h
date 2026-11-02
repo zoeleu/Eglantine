@@ -127,6 +127,19 @@ struct SyncedBinding {
     u64 mark_sequence{};
 };
 
+/// A storage buffer descriptor as last resolved (BindGraphicsStorageBuffer): reused while the
+/// descriptor words and the address space's mappings are unchanged.
+struct ResolvedStorageBuffer {
+    GPUVAddr ssbo_addr{};
+    std::array<u64, 2> words{};
+    size_t memory_manager_id{~size_t{}};
+    u64 map_generation{};
+    bool is_written{};
+    Binding binding{};
+    BufferId found_buffer_id{}; ///< FindBuffer's answer for `binding`, at buffers_generation
+    u64 buffers_generation{~u64{}};
+};
+
 class BufferCacheChannelInfo : public ChannelInfo {
 public:
     BufferCacheChannelInfo() = delete;
@@ -146,6 +159,8 @@ public:
     SyncedBinding synced_index_buffer;
     std::array<SyncedBinding, NUM_VERTEX_BUFFERS> synced_vertex_buffers;
     std::array<std::array<SyncedBinding, NUM_STORAGE_BUFFERS>, NUM_STAGES> synced_storage_buffers;
+    std::array<std::array<ResolvedStorageBuffer, NUM_STORAGE_BUFFERS>, NUM_STAGES>
+        resolved_storage_buffers;
 
     std::array<Binding, NUM_COMPUTE_UNIFORM_BUFFERS> compute_uniform_buffers;
     std::array<Binding, NUM_STORAGE_BUFFERS> compute_storage_buffers;

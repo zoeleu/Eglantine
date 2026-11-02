@@ -505,9 +505,32 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
 
     const auto& cbufs = maxwell3d->state.shader_stages[stage];
     const GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
-    channel_state->storage_buffers[stage][ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
-    return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
+    Binding& binding = channel_state->storage_buffers[stage][ssbo_index];
+    if (g_draw_cache) {
+        // Resolving takes a mapping lookup under the memory manager's mutex and two address
+        // translations, for the same descriptor draw after draw.
+        auto& resolved = channel_state->resolved_storage_buffers[stage][ssbo_index];
+        const std::array<u64, 2> words{gpu_memory->Read<u64>(ssbo_addr),
+                                       gpu_memory->Read<u64>(ssbo_addr + 8)};
+        const size_t memory_manager_id = gpu_memory->GetID();
+        const u64 map_generation = gpu_memory->MapGeneration();
+        if (resolved.ssbo_addr != ssbo_addr || resolved.words != words ||
+            resolved.memory_manager_id != memory_manager_id ||
+            resolved.map_generation != map_generation || resolved.is_written != is_written) {
+            resolved = {
+                .ssbo_addr = ssbo_addr,
+                .words = words,
+                .memory_manager_id = memory_manager_id,
+                .map_generation = map_generation,
+                .is_written = is_written,
+                .binding = StorageBufferBinding(ssbo_addr, cbuf_index, is_written),
+            };
+        }
+        binding = resolved.binding;
+    } else {
+        binding = StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
+    }
+    return (binding.buffer_id != NULL_BUFFER_ID);
 }
 
 template <class P>
@@ -1521,8 +1544,18 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         // Resolve buffer
         Binding& binding = channel_state->storage_buffers[stage][index];
-        const BufferId buffer_id = FindBuffer(binding.device_addr, binding.size, false);
-        binding.buffer_id = buffer_id;
+        auto& resolved = channel_state->resolved_storage_buffers[stage][index];
+        // FindBuffer synchronizes buffer writes in accurate mode, so it runs every time there.
+        if (g_draw_cache && !Settings::IsGPUFenceBehaviorAccurate() &&
+            resolved.buffers_generation == buffers_generation &&
+            resolved.binding.device_addr == binding.device_addr &&
+            resolved.binding.size == binding.size) {
+            binding.buffer_id = resolved.found_buffer_id;
+        } else {
+            binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
+            resolved.found_buffer_id = binding.buffer_id;
+            resolved.buffers_generation = buffers_generation;
+        }
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
         ResolveMultiRangeStorage(binding, is_written, graphics_segments);
     });
