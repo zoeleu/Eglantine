@@ -18,6 +18,8 @@ add_executable(tests
     common/unique_function.cpp
     core/core_timing.cpp
     core/internal_network/network.cpp
+    core/nrr.cpp
+    core/nso.cpp
     video_core/memory_tracker.cpp
     video_core/ampere_returns.cpp
     video_core/ampere_integer_multiply.cpp
