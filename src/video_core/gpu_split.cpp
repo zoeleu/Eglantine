@@ -270,13 +270,11 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
         if ((head & Direct) != 0) {
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
             engine->CallMethod(*system, method, argument, true);
         } else if (!engine->execution_mask[method]) {
             engine->method_sink.emplace_back(method, argument);
         } else {
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
             if ((head & HasSegment) != 0) {
                 engine->current_dma_segment = entry[1];
@@ -290,7 +288,6 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
-        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         if ((head & HasSegment) != 0) {
             engine->current_dma_segment = entry[2];
@@ -342,6 +339,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         }
         u64 last_store = read_position;
         g_back_busy.store(true, std::memory_order_relaxed);
+        // One zone for the batch, not one per method: two clock reads per method cost more
+        // than most methods. Nested zones (draws, compute, uploads) still count separately.
+        Nx2Profile::Scope batch_scope{Nx2Profile::Zone::Method};
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             const size_t size = Execute(&ring[index]);
