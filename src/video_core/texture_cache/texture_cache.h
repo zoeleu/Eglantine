@@ -1648,6 +1648,15 @@ template <typename StagingBuffer>
 void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) {
     const std::span<u8> mapped_span = staging.mapped_span;
     const GPUVAddr gpu_addr = image.gpu_addr;
+    namespace Profile = VideoCommon::Nx2Profile;
+    if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
+        Profile::Add(Profile::Counter::UploadsAccelerated, 1);
+    } else {
+        Profile::Add(Profile::Counter::UploadsUnswizzled, 1);
+        if (True(image.flags & ImageFlagBits::Converted)) {
+            Profile::Add(Profile::Counter::UploadsConverted, 1);
+        }
+    }
 
     if (True(image.flags & ImageFlagBits::AcceleratedUpload) && image.host_level_offset != 0) {
         // Only levels >= host_level_offset exist on the host: read each layer's tail of the mip
