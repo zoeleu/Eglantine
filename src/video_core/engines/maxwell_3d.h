@@ -3316,10 +3316,11 @@ private:
         u32 amount;
         u32 pending;
     };
-    std::array<RecentWrite, 48> recent_writes{};
+    std::array<RecentWrite, 64> recent_writes{}; // Power of two: the index wraps with a mask
     size_t recent_write_index = 0;
     void RecordWrite(u32 method, u32 argument, u32 amount, u32 pending) {
-        recent_writes[recent_write_index++ % recent_writes.size()] = {method, argument, amount, pending};
+        recent_writes[recent_write_index++ & (recent_writes.size() - 1)] = {method, argument, amount,
+                                                                            pending};
     }
     void DumpRecentWrites(u32 method);
     /// Parameters that have been submitted to the macro call so far.

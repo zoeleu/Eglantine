@@ -21,6 +21,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
@@ -143,6 +144,7 @@ void GpuSplit::Stop() {
     publish_every = PublishEvery;
     front_engine = nullptr;
     back_engine = nullptr;
+    back_maxwell_3d = nullptr;
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
@@ -257,6 +259,16 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
     });
 }
 
+void GpuSplit::CallBackMethod(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                              bool is_last) {
+    // Maxwell3D is final: a direct call (most methods go to it).
+    if (back_maxwell_3d != nullptr) {
+        back_maxwell_3d->CallMethod(*system, method, argument, is_last);
+    } else {
+        engine->CallMethod(*system, method, argument, is_last);
+    }
+}
+
 size_t GpuSplit::Execute(const u64* entry) {
     const u64 head = entry[0];
     switch (static_cast<Kind>(head & 0xf)) {
@@ -264,6 +276,9 @@ size_t GpuSplit::Execute(const u64* entry) {
         return 0;
     case Kind::Engine:
         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
+        back_maxwell_3d = back_engine->is_maxwell_3d
+                              ? static_cast<Tegra::Engines::Maxwell3D*>(back_engine)
+                              : nullptr;
         return 2;
     case Kind::Method: {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
@@ -271,7 +286,7 @@ size_t GpuSplit::Execute(const u64* entry) {
         auto* const engine = back_engine;
         if ((head & Direct) != 0) {
             engine->ConsumeSink(*system);
-            engine->CallMethod(*system, method, argument, true);
+            CallBackMethod(engine, method, argument, true);
         } else if (!engine->execution_mask[method]) {
             engine->method_sink.emplace_back(method, argument);
         } else {
@@ -279,7 +294,7 @@ size_t GpuSplit::Execute(const u64* entry) {
             if ((head & HasSegment) != 0) {
                 engine->current_dma_segment = entry[1];
             }
-            engine->CallMethod(*system, method, argument, (head & IsLast) != 0);
+            CallBackMethod(engine, method, argument, (head & IsLast) != 0);
         }
         return (head & HasSegment) != 0 ? 2 : 1;
     }
@@ -292,8 +307,13 @@ size_t GpuSplit::Execute(const u64* entry) {
         if ((head & HasSegment) != 0) {
             engine->current_dma_segment = entry[2];
         }
-        engine->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
-                                amount, static_cast<u32>(entry[1]));
+        const auto* const words = reinterpret_cast<const u32*>(entry + data);
+        const auto pending = static_cast<u32>(entry[1]);
+        if (back_maxwell_3d != nullptr) {
+            back_maxwell_3d->CallMultiMethod(*system, method, words, amount, pending);
+        } else {
+            engine->CallMultiMethod(*system, method, words, amount, pending);
+        }
         return data + (amount + 1) / 2;
     }
     case Kind::Call: {
