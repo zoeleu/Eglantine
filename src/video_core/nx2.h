@@ -285,7 +285,7 @@ public:
         std::scoped_lock lk{mutex};
         std::erase_if(waiters, [owner](const Waiter& w) { return w.owner == owner; });
         waiters.push_back({owner, device_address, value, operation, false, armed});
-        count.store(waiters.size(), std::memory_order_release);
+        PublishCounts();
     }
 
     /// The back reached the acquire of a waiter added unarmed; `met`: the value held there.
@@ -297,28 +297,21 @@ public:
                 w.latched = w.latched || met;
             }
         }
-    }
-
-    [[nodiscard]] bool Armed(const void* owner) {
-        if (count.load(std::memory_order_acquire) == 0) {
-            return true;
-        }
-        std::scoped_lock lk{mutex};
-        return std::ranges::none_of(waiters,
-                                    [owner](const Waiter& w) { return w.owner == owner && !w.armed; });
+        PublishCounts();
     }
 
     void Remove(const void* owner) {
-        if (count.load(std::memory_order_acquire) == 0) {
+        if (counts.total.load(std::memory_order_acquire) == 0) {
             return;
         }
         std::scoped_lock lk{mutex};
         std::erase_if(waiters, [owner](const Waiter& w) { return w.owner == owner; });
-        count.store(waiters.size(), std::memory_order_release);
+        PublishCounts();
     }
 
+    // Polled by suspended channels: no lock while nothing is latched (or unarmed).
     [[nodiscard]] bool Latched(const void* owner) {
-        if (count.load(std::memory_order_acquire) == 0) {
+        if (counts.latched.load(std::memory_order_acquire) == 0) {
             return false;
         }
         std::scoped_lock lk{mutex};
@@ -326,16 +319,30 @@ public:
                                    [owner](const Waiter& w) { return w.owner == owner && w.latched; });
     }
 
+    [[nodiscard]] bool Armed(const void* owner) {
+        if (counts.unarmed.load(std::memory_order_acquire) == 0) {
+            return true;
+        }
+        std::scoped_lock lk{mutex};
+        return std::ranges::none_of(waiters,
+                                    [owner](const Waiter& w) { return w.owner == owner && !w.armed; });
+    }
+
     /// A GPU write of `value` to the u32 at `device_address`.
     void OnWrite(u64 device_address, u32 value) {
-        if (count.load(std::memory_order_acquire) == 0) {
+        if (counts.total.load(std::memory_order_acquire) == 0) {
             return;
         }
         std::scoped_lock lk{mutex};
+        bool latched = false;
         for (auto& w : waiters) {
             if (w.address == device_address && w.armed && !w.latched && Matches(w, value)) {
                 w.latched = true;
+                latched = true;
             }
+        }
+        if (latched) {
+            PublishCounts();
         }
     }
 
@@ -362,9 +369,23 @@ private:
         }
     }
 
-    std::mutex mutex;
+    /// With `mutex` held.
+    void PublishCounts() {
+        const auto latched = std::ranges::count_if(waiters, [](const Waiter& w) { return w.latched; });
+        const auto unarmed = std::ranges::count_if(waiters, [](const Waiter& w) { return !w.armed; });
+        counts.latched.store(static_cast<size_t>(latched), std::memory_order_release);
+        counts.unarmed.store(static_cast<size_t>(unarmed), std::memory_order_release);
+        counts.total.store(waiters.size(), std::memory_order_release);
+    }
+
+    // The front polls the counts while the back locks to latch: keep them off the lock's line.
+    alignas(64) std::mutex mutex;
     std::vector<Waiter> waiters;
-    std::atomic<size_t> count{};
+    struct alignas(64) Counts {
+        std::atomic<size_t> total{};
+        std::atomic<size_t> latched{};
+        std::atomic<size_t> unarmed{};
+    } counts;
 };
 
 } // namespace Tegra
