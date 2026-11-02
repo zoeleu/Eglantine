@@ -160,7 +160,8 @@ private:
 
     void FlushWork();
 
-    void UpdateDynamicStates();
+    /// `pipeline`: the draw's pipeline, for dynamic vertex input (null: looked up).
+    void UpdateDynamicStates(GraphicsPipeline* pipeline);
 
     void HandleTransformFeedback();
 
