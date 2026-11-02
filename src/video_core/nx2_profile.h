@@ -13,6 +13,14 @@
 #include "common/logging.h"
 #include "common/cpu_features.h"
 
+#ifdef ARCHITECTURE_x86_64
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+#endif
+
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
 // (exclusive) time, nested zones excluded; every 10 s the thread logs each zone's share.
 namespace VideoCommon::Nx2Profile {
@@ -48,9 +56,12 @@ enum class Zone : u32 {
     TextureUpload,
     Fence,        ///< Fences made (SignalFence)
     FenceSkipped, ///< Empty fences not made
-    Method,       ///< Engine method calls (what a split GPU thread's back half would run)
+    Method,       ///< Engine method calls; on a split's back thread, the whole ring batch
     SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h)
     SplitWait,    ///< Split GPU thread: the back waits for work
+    FlushCaching, ///< Pre-draw invalidation of ranges written since the last draw
+    DispatchWork, ///< Scheduler chunks handed to the worker every 32 draws
+    SchedulerFlush, ///< Scheduler flushes every 4096 draws
     Count,
 };
 
@@ -61,7 +72,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "sync descriptors", "read handles", "fill image views", "texture buffers", "update buffers",
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
-    "fence skipped", "method", "split drain", "split wait",
+    "fence skipped", "method", "split drain", "split wait", "flush caching",
+    "dispatch work", "scheduler flush",
 };
 
 // Read once at startup: Enabled() runs several times per method write (no guard to check).
@@ -71,18 +83,28 @@ inline bool Enabled() {
     return g_enabled;
 }
 
-// Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
-// run ~150,000 times a second, and QueryPerformanceCounter cost ~5% of the GPU thread).
+// Ticks: the TSC read without fences on x86-64 (the zones run millions of times a second, and
+// the wall clock's fenced read cost tens of nanoseconds each, counted as GPU work), nanoseconds
+// elsewhere. Report() converts with the wall clock over the same window.
 inline u64 Now() {
+#ifdef ARCHITECTURE_x86_64
+    return __rdtsc();
+#else
+    return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+#endif
+}
+
+inline u64 WallNs() {
     return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
 }
 
 struct ThreadData {
-    std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
+    std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ticks{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
-    u64 child_ns{};    ///< Time of the zones nested in the current one
-    u64 window_start{};
+    std::array<u64, 16> counters{}; ///< See Counter
+    u64 child_ticks{}; ///< Time of the zones nested in the current one
+    u64 window_start{};    ///< Now() at the window's start
+    u64 window_start_ns{}; ///< WallNs() at the window's start
 };
 
 inline thread_local ThreadData t_data;
@@ -93,8 +115,8 @@ public:
         if (!enabled) {
             return;
         }
-        parent_child_ns = t_data.child_ns;
-        t_data.child_ns = 0;
+        parent_child_ticks = t_data.child_ticks;
+        t_data.child_ticks = 0;
         start = Now();
     }
 
@@ -105,9 +127,9 @@ public:
         const u64 elapsed = Now() - start;
         auto& data = t_data;
         const auto index = static_cast<size_t>(zone);
-        data.exclusive_ns[index] += elapsed - data.child_ns;
+        data.exclusive_ticks[index] += elapsed - data.child_ticks;
         ++data.count[index];
-        data.child_ns = parent_child_ns + elapsed;
+        data.child_ticks = parent_child_ticks + elapsed;
     }
 
     Scope(const Scope&) = delete;
@@ -117,7 +139,7 @@ private:
     Zone zone;
     bool enabled;
     u64 start{};
-    u64 parent_child_ns{};
+    u64 parent_child_ticks{};
 };
 
 /// Amounts counted on the GPU thread, logged per second with the zones.
@@ -130,6 +152,14 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    AcquireDeferred, ///< Of AcquireChecks: checked on the split's back thread, not drained
+    AcquireMetEarly, ///< Acquires met without the front draining the back
+    AcquireMetDrained, ///< Acquires met after the front drained the back
+    AcquireDrainsAvoided, ///< Resume checks that returned while the back was busy
+    UploadsAccelerated, ///< Image uploads swizzled on the host GPU
+    UploadsUnswizzled,  ///< Image uploads unswizzled on the CPU
+    UploadsConverted,   ///< Of UploadsUnswizzled: also converted on the CPU (ASTC, BCn, ...)
+    StagingCreations,   ///< Staging buffers made because the stream buffer's regions were busy
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -152,29 +182,33 @@ inline void Report(const char* thread_name = "GPU thread") {
         return;
     }
     auto& data = t_data;
-    const u64 now = Now();
-    if (data.window_start == 0) {
-        data.window_start = now;
-        data.child_ns = 0;
+    const u64 now_ns = WallNs();
+    if (data.window_start_ns == 0) {
+        data.window_start = Now();
+        data.window_start_ns = now_ns;
+        data.child_ticks = 0;
         return;
     }
-    const u64 window = now - data.window_start;
+    const u64 window = now_ns - data.window_start_ns;
     if (window < 10'000'000'000ULL) {
         return;
     }
+    const u64 now = Now();
+    const u64 window_ticks = now - data.window_start;
     // Time in no zone at all is the wall time minus the zones' totals.
     u64 zoned{};
-    for (size_t i = 1; i < data.exclusive_ns.size(); ++i) {
-        zoned += data.exclusive_ns[i];
+    for (size_t i = 1; i < data.exclusive_ticks.size(); ++i) {
+        zoned += data.exclusive_ticks[i];
     }
-    data.exclusive_ns[0] = window > zoned ? window - zoned : 0;
+    data.exclusive_ticks[0] = window_ticks > zoned ? window_ticks - zoned : 0;
     std::string line;
-    for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {
-        if (data.exclusive_ns[i] == 0 && data.count[i] == 0) {
+    for (size_t i = 0; i < data.exclusive_ticks.size(); ++i) {
+        if (data.exclusive_ticks[i] == 0 && data.count[i] == 0) {
             continue;
         }
         // Per second of wall time: milliseconds spent and calls made.
-        const double ms = static_cast<double>(data.exclusive_ns[i]) * 1000.0 / window;
+        const double ms =
+            static_cast<double>(data.exclusive_ticks[i]) * 1000.0 / static_cast<double>(window_ticks);
         const double calls = static_cast<double>(data.count[i]) * 1e9 / window;
         line += fmt::format(" | {} {:.1f} ms ({:.0f}/s)", zone_names[i], ms, calls);
     }
@@ -187,12 +221,24 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | 3D register writes {:.0f} ({:.0f} same value)",
                         static_cast<double>(data.counters[4]) * 1e9 / window,
                         static_cast<double>(data.counters[5]) * 1e9 / window);
-    line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
+    line += fmt::format(" | acquires {:.0f} ({:.0f} waited, {:.0f} deferred to the back; met "
+                        "{:.0f} without a drain, {:.0f} after one; {:.0f} drains avoided)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
-                        static_cast<double>(data.counters[7]) * 1e9 / window);
+                        static_cast<double>(data.counters[7]) * 1e9 / window,
+                        static_cast<double>(data.counters[8]) * 1e9 / window,
+                        static_cast<double>(data.counters[9]) * 1e9 / window,
+                        static_cast<double>(data.counters[10]) * 1e9 / window,
+                        static_cast<double>(data.counters[11]) * 1e9 / window);
+    line += fmt::format(" | image uploads: {:.0f} accelerated, {:.0f} CPU unswizzle ({:.0f} "
+                        "converted) | staging buffers made {:.0f}",
+                        static_cast<double>(data.counters[12]) * 1e9 / window,
+                        static_cast<double>(data.counters[13]) * 1e9 / window,
+                        static_cast<double>(data.counters[14]) * 1e9 / window,
+                        static_cast<double>(data.counters[15]) * 1e9 / window);
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     data = {};
     data.window_start = now;
+    data.window_start_ns = now_ns;
 }
 
 } // namespace VideoCommon::Nx2Profile

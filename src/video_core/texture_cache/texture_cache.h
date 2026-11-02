@@ -31,6 +31,7 @@
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_draw_cache.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/textures/decoders.h"
 
@@ -507,7 +508,11 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
     if (is_new) {
         auto const id = FindSampler(descriptor, compute);
         channel_state->sampler_ids.insert_or_assign(map_index, id);
+        table.SetResolved(index, id);
         return id;
+    }
+    if (g_draw_cache) {
+        return table.Resolved(index);
     }
     return channel_state->sampler_ids.find(map_index)->second;
 }
@@ -743,15 +748,19 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
                 pair->second = CreateImageView(descriptor);
             PrepareImageView(pair->second, false, false);
             channel_state->image_view_ids.insert_or_assign(map_index, pair->second);
+            table.SetResolved(index, pair->second);
             return pair->second;
         }
         channel_state->image_view_ids.insert_or_assign(map_index, NULL_IMAGE_VIEW_ID);
+        table.SetResolved(index, NULL_IMAGE_VIEW_ID);
         return NULL_IMAGE_VIEW_ID;
     }
-    auto const it = channel_state->image_view_ids.find(map_index);
-    if (it->second != NULL_IMAGE_VIEW_ID)
-        PrepareImageView(it->second, false, false);
-    return it->second;
+    // The hash lookup ran for every view of every draw; the table keeps the same answer.
+    const ImageViewId id =
+        g_draw_cache ? table.Resolved(index) : channel_state->image_view_ids.find(map_index)->second;
+    if (id != NULL_IMAGE_VIEW_ID)
+        PrepareImageView(id, false, false);
+    return id;
 }
 
 template <class P>
@@ -1672,6 +1681,15 @@ template <typename StagingBuffer>
 void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) {
     const std::span<u8> mapped_span = staging.mapped_span;
     const GPUVAddr gpu_addr = image.gpu_addr;
+    namespace Profile = VideoCommon::Nx2Profile;
+    if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
+        Profile::Add(Profile::Counter::UploadsAccelerated, 1);
+    } else {
+        Profile::Add(Profile::Counter::UploadsUnswizzled, 1);
+        if (True(image.flags & ImageFlagBits::Converted)) {
+            Profile::Add(Profile::Counter::UploadsConverted, 1);
+        }
+    }
 
     if (True(image.flags & ImageFlagBits::AcceleratedUpload) && image.host_level_offset != 0) {
         // Only levels >= host_level_offset exist on the host: read each layer's tail of the mip

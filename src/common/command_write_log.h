@@ -104,8 +104,9 @@ private:
     /// Per filter slot, the sequence of the last logged write to it (0: none).
     std::array<std::atomic<u64>, filter_size> slot_writes{};
     std::array<Write, log_size> writes{};
-    std::atomic<u64> sequence{};
-    mutable std::mutex mutex;
+    // Read on every check: kept off the lines the writer stores entries and locks on.
+    alignas(64) std::atomic<u64> sequence{};
+    alignas(64) mutable std::mutex mutex;
 };
 
 } // namespace Common

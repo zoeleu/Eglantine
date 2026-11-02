@@ -103,6 +103,10 @@ protected:
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
 
+    /// Bumped whenever shaders are removed: pointers to ShaderInfo or lookups cached under an
+    /// older value may be stale.
+    std::atomic<u64> shader_removals{};
+
 private:
     /// @brief Tries to obtain a cached shader starting in a given address
     /// @note Doesn't check for ranges, the given address has to be the start of the shader
@@ -147,6 +151,9 @@ private:
     /// @brief Create a new shader entry and register it
     const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr);
 
+    /// Whether [addr, addr + size) can't reach a registered or rejected program (no lock).
+    bool OutsideTrackedRange(VAddr addr, size_t size) const;
+
     /// Rethrows the error a native program at this address was rejected with, if any.
     void RethrowIfRejected(VAddr addr);
     /// Whether a native program at this address was rejected.
@@ -171,6 +178,11 @@ private:
     /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
+    /// Bounds of every program ever registered (never shrink), and whether shaders wait in
+    /// marked_for_removal: invalidations outside both need no lock.
+    std::atomic<VAddr> registered_lowest{~VAddr{}};
+    std::atomic<VAddr> registered_highest{};
+    std::atomic<bool> removals_pending{};
 };
 
 } // namespace VideoCommon

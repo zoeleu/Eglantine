@@ -13,6 +13,7 @@
 #include <type_traits>
 #include "common/container/unordered_set.h"
 #include <utility>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/common_types.h"
@@ -32,8 +33,30 @@ class MemoryTrackerBase {
     using Manager = WordManager<DeviceTracker, WORDS_STACK_NEEDED, HIGHER_PAGE_SIZE>;
 
 public:
-    MemoryTrackerBase(DeviceTracker& device_tracker_) : device_tracker{&device_tracker_} {}
+    MemoryTrackerBase(DeviceTracker& device_tracker_)
+        : device_tracker{&device_tracker_}, chunk_mark_sequence(NUM_MARK_CHUNKS) {}
     ~MemoryTrackerBase() = default;
+
+    /// The last time a region was marked CPU modified, to compare against later.
+    [[nodiscard]] u64 CpuMarkSequence() const noexcept {
+        return cpu_mark_sequence;
+    }
+
+    /// Whether a part of the region may have been marked CPU modified after `sequence` (by 1 MiB
+    /// chunk, so neighbouring writes count too): a region synchronized at `sequence` that
+    /// returns false has nothing new to upload.
+    [[nodiscard]] bool CpuMarkedSince(VAddr cpu_addr, u64 size, u64 sequence) const noexcept {
+        if (size == 0) {
+            return false;
+        }
+        const u64 last = (cpu_addr + size - 1) >> MARK_CHUNK_BITS;
+        for (u64 chunk = cpu_addr >> MARK_CHUNK_BITS; chunk <= last; ++chunk) {
+            if (chunk_mark_sequence[chunk & (NUM_MARK_CHUNKS - 1)] > sequence) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /// Returns the inclusive CPU modified range in a begin end pair
     [[nodiscard]] std::pair<u64, u64> ModifiedCpuRegion(VAddr query_cpu_addr, u64 query_size) noexcept {
@@ -72,6 +95,7 @@ public:
 
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
+        NoteCpuMarks(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size);
         });
@@ -115,6 +139,7 @@ public:
     /// Mark region as modified from the CPU
     /// but don't mark it as modified until FlusHCachedWrites is called.
     void CachedCpuWrite(VAddr dirty_cpu_addr, u64 query_size) {
+        NoteCpuMarks(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [this](Manager* manager, u64 offset, size_t size) {
             const VAddr cpu_address = manager->cpu_addr + offset;
             manager->ChangeRegionState(Type::CachedCPU, true, cpu_address, size);
@@ -124,13 +149,15 @@ public:
 
     /// Flushes cached CPU writes, and notify the device_tracker about the deltas
     void FlushCachedWrites(VAddr query_cpu_addr, u64 query_size) noexcept {
-        IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, [[maybe_unused]] u64 offset, [[maybe_unused]] size_t size) {
+        IteratePages<false>(query_cpu_addr, query_size, [this](Manager* manager, [[maybe_unused]] u64 offset, [[maybe_unused]] size_t size) {
+            NoteCpuMarks(manager->cpu_addr, HIGHER_PAGE_SIZE);
             manager->FlushCachedWrites();
         });
     }
 
     void FlushCachedWrites() noexcept {
         for (auto id : cached_pages) {
+            NoteCpuMarks(top_tier[id]->cpu_addr, HIGHER_PAGE_SIZE);
             top_tier[id]->FlushCachedWrites();
         }
         cached_pages.clear();
@@ -237,6 +264,7 @@ private:
     void CreateRegion(std::size_t page_index) {
         const VAddr base_cpu_addr = page_index << HIGHER_PAGE_BITS;
         top_tier[page_index] = GetNewManager(base_cpu_addr);
+        NoteCpuMarks(base_cpu_addr, HIGHER_PAGE_SIZE); // a new region starts all CPU modified
     }
 
     Manager* GetNewManager(VAddr base_cpu_address) {
@@ -254,11 +282,27 @@ private:
         return new_manager;
     }
 
+    static constexpr size_t MARK_CHUNK_BITS = 20;
+    static constexpr size_t NUM_MARK_CHUNKS = 1ULL << (MAX_CPU_PAGE_BITS - MARK_CHUNK_BITS);
+
+    void NoteCpuMarks(VAddr cpu_addr, u64 size) noexcept {
+        if (size == 0) {
+            return;
+        }
+        ++cpu_mark_sequence;
+        const u64 last = (cpu_addr + size - 1) >> MARK_CHUNK_BITS;
+        for (u64 chunk = cpu_addr >> MARK_CHUNK_BITS; chunk <= last; ++chunk) {
+            chunk_mark_sequence[chunk & (NUM_MARK_CHUNKS - 1)] = cpu_mark_sequence;
+        }
+    }
+
     std::array<Manager*, NUM_HIGH_PAGES> top_tier{};
     std::deque<std::array<Manager, MANAGER_POOL_SIZE>> manager_pool;
     std::deque<Manager*> free_managers;
     ::Common::unordered_set<u32> cached_pages;
     DeviceTracker* device_tracker = nullptr;
+    u64 cpu_mark_sequence = 0;
+    std::vector<u64> chunk_mark_sequence; ///< cpu_mark_sequence of each chunk's last mark
 };
 
 } // namespace VideoCommon

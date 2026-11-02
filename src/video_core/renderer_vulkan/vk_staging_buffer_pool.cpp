@@ -15,6 +15,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -131,6 +132,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
     if (AreRegionsActive(Region(free_iterator) + 1,
                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
         // Avoid waiting for the previous usages to be free
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::StagingCreations, 1);
         return GetStagingBuffer(size, MemoryUsage::Upload);
     }
     const u64 current_tick = scheduler.CurrentTick();
@@ -148,6 +150,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
 
         if (AreRegionsActive(0, Region(size) + 1)) {
             // Avoid waiting for the previous usages to be free
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::StagingCreations, 1);
             return GetStagingBuffer(size, MemoryUsage::Upload);
         }
     }

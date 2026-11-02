@@ -258,6 +258,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     {
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
+    }
+    {
+        Profile::Scope scope{Profile::Zone::FlushCaching};
         gpu_memory->FlushCaching();
     }
 
@@ -289,7 +292,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
-        UpdateDynamicStates();
+        UpdateDynamicStates(pipeline);
     }
 
     query_cache.NotifySegment(true);
@@ -425,8 +428,7 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
-void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
-    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+bool RasterizerVulkan::DebugDraw(bool is_indexed) {
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);
@@ -520,7 +522,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     if (!skip_list.empty()) {
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
-        if (std::find(skip_list.begin(), skip_list.end(), vs) != skip_list.end()) return;
+        if (std::find(skip_list.begin(), skip_list.end(), vs) != skip_list.end()) return true;
     }
     // EDEN_NX2_RT_TRACE: log the first draw to every distinct colour target (debug aid).
     if (static const bool trace = std::getenv("EDEN_NX2_RT_TRACE") != nullptr; trace) {
@@ -535,6 +537,25 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      rt.Address(), rt.width, rt.height, static_cast<u32>(rt.format), vs, ps,
                      regs.blend.enable[0], seen.size());
         }
+    }
+    return false;
+}
+
+void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    // Draw-time debug aids (EDEN_NX2_* trace and skip variables), out of the per-draw path
+    // unless one is set or the after-upscale trace is armed.
+    static const bool draw_debug = [] {
+        for (const char* name : {"EDEN_NX2_WINDOW_TRACE", "EDEN_NX2_CB24_TRACE", "EDEN_NX2_TRACE_VS",
+                                 "EDEN_NX2_SKIP_VS", "EDEN_NX2_RT_TRACE"}) {
+            if (std::getenv(name) != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    if ((draw_debug || Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) && DebugDraw(is_indexed)) {
+        return;
     }
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
@@ -638,7 +659,7 @@ void RasterizerVulkan::DrawTexture() {
     texture_cache.SynchronizeDescriptors(false);
     texture_cache.UpdateRenderTargets(false);
 
-    UpdateDynamicStates();
+    UpdateDynamicStates(nullptr);
 
     query_cache.NotifySegment(true);
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
@@ -1346,10 +1367,13 @@ void RasterizerVulkan::FlushWork() {
     if ((++draw_counter & CHECK_MASK) != CHECK_MASK) {
         return;
     }
+    namespace Profile = VideoCommon::Nx2Profile;
     if (draw_counter < DRAWS_TO_DISPATCH) {
+        Profile::Scope scope{Profile::Zone::DispatchWork};
         scheduler.DispatchWork();
         return;
     }
+    Profile::Scope scope{Profile::Zone::SchedulerFlush};
     scheduler.Flush();
     draw_counter = 0;
 }
@@ -1413,7 +1437,7 @@ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
     return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
 }
 
-void RasterizerVulkan::UpdateDynamicStates() {
+void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* pipeline) {
     auto& regs = maxwell3d->regs;
     auto& flags = maxwell3d->dirty.flags;
     const auto topology = maxwell3d->draw_manager.draw_state.topology;
@@ -1491,7 +1515,10 @@ void RasterizerVulkan::UpdateDynamicStates() {
     }
 
     if (device.IsExtVertexInputDynamicStateSupported()) {
-        if (auto* gp = pipeline_cache.CurrentGraphicsPipeline(); gp && gp->HasDynamicVertexInput()) {
+        if (pipeline == nullptr) {
+            pipeline = pipeline_cache.CurrentGraphicsPipeline();
+        }
+        if (pipeline && pipeline->HasDynamicVertexInput()) {
             UpdateVertexInput(regs);
         }
     }
