@@ -379,6 +379,7 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
         return;
     }
     std::memcpy(ptr, &value, sizeof(T));
+    Common::CommandWriteLog::Get().Note(reinterpret_cast<const u8*>(ptr), sizeof(T));
 }
 
 template <typename Traits>
@@ -478,6 +479,7 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
             std::memcpy(dst_ptr, src_pointer, copy_amount);
+            Common::CommandWriteLog::Get().Note(dst_ptr, copy_amount);
         },
         [&](const std::size_t copy_amount) {
             src_pointer = static_cast<const u8*>(src_pointer) + copy_amount;
@@ -544,6 +546,7 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
             std::memcpy(dst_ptr, src_pointer, copy_amount);
+            Common::CommandWriteLog::Get().Note(dst_ptr, copy_amount);
         },
         [&](const std::size_t copy_amount) {
             src_pointer = static_cast<const u8*>(src_pointer) + copy_amount;

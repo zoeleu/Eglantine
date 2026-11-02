@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
+#include "common/command_write_log.h"
 #include "common/common_types.h"
 #include "common/multi_level_page_table.h"
 #include "common/range_map.h"
@@ -174,6 +176,20 @@ public:
     const u8* GetSpan(const GPUVAddr src_addr, const std::size_t size) const;
     u8* GetSpan(const GPUVAddr src_addr, const std::size_t size);
 
+    /// NX2 command list snapshots (nvhost_gpu.cpp): marks the memory of submitted command words in
+    /// Common::CommandWriteLog, so the GPU's own writes to it are logged until `marks` is released.
+    void MarkCommandMemory(GPUVAddr gpu_addr, std::size_t size,
+                           Common::CommandWriteLog::Marks& marks);
+
+    /// Whether the GPU wrote to the memory under [gpu_addr, gpu_addr + size) after `sequence`
+    /// (Common::CommandWriteLog::Sequence()), through this or any other mapping of it.
+    [[nodiscard]] Common::CommandWriteLog::Result CommandMemoryWrittenSince(GPUVAddr gpu_addr,
+                                                                          std::size_t size,
+                                                                          u64 sequence);
+
+    /// Logs a write made in place, through a span (Core::Memory::GuestMemoryScoped).
+    void NoteCommandMemoryWrite(GPUVAddr gpu_addr, std::size_t size);
+
 private:
     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
@@ -186,6 +202,20 @@ private:
             return (gpu_addr >> big_page_bits) & big_page_table_mask;
         } else {
             return (gpu_addr >> page_bits) & page_table_mask;
+        }
+    }
+
+    /// Calls func(host pointer, size) for each mapped CPU page of the range.
+    template <typename Func>
+    void ForEachHostRange(GPUVAddr gpu_addr, std::size_t size, Func&& func) {
+        const GPUVAddr end = gpu_addr + size;
+        while (gpu_addr < end) {
+            const GPUVAddr next =
+                (std::min)((gpu_addr | ((GPUVAddr{1} << cpu_page_bits) - 1)) + 1, end);
+            if (u8* const pointer = GetPointer(gpu_addr)) {
+                func(pointer, static_cast<std::size_t>(next - gpu_addr));
+            }
+            gpu_addr = next;
         }
     }
 

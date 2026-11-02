@@ -211,9 +211,15 @@ public:
                     this->m_memory->WriteBlockUnsafe(this->m_addr, this->data(),
                                                      this->size_bytes());
                 }
-            } else if constexpr ((FLAGS & GuestMemoryFlags::Safe) ||
-                                 (FLAGS & GuestMemoryFlags::Cached)) {
-                this->m_memory->InvalidateRegion(this->m_addr, this->size_bytes());
+            } else {
+                // Written in place: the GPU memory managers log GPU writes to command memory.
+                if constexpr (requires { this->m_memory->NoteCommandMemoryWrite(0, 0); }) {
+                    this->m_memory->NoteCommandMemoryWrite(this->m_addr, this->size_bytes());
+                }
+                if constexpr ((FLAGS & GuestMemoryFlags::Safe) ||
+                              (FLAGS & GuestMemoryFlags::Cached)) {
+                    this->m_memory->InvalidateRegion(this->m_addr, this->size_bytes());
+                }
             }
         }
     }

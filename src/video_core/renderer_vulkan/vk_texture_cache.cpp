@@ -201,6 +201,35 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
     return layer_uploads && size >= (32U << 20) && Tegra::Nx2InSparseRegion(gpu_addr, size);
 }
 
+// Vulkan's standard sparse block shape for single-sampled 2D images (64 KiB blocks), in texel
+// blocks, for a texel block of `block_bytes`. Only valid when the device reports
+// residencyStandard2DBlockShape.
+[[nodiscard]] bool StandardSparseBlockShape(const Device& device, u64 block_bytes,
+                                            VkExtent3D& shape) {
+    if (!device.GetPhysical().GetProperties().sparseProperties.residencyStandard2DBlockShape) {
+        return false;
+    }
+    switch (block_bytes) {
+    case 1:
+        shape = {256, 256, 1};
+        return true;
+    case 2:
+        shape = {256, 128, 1};
+        return true;
+    case 4:
+        shape = {128, 128, 1};
+        return true;
+    case 8:
+        shape = {128, 64, 1};
+        return true;
+    case 16:
+        shape = {64, 64, 1};
+        return true;
+    default:
+        return false;
+    }
+}
+
 // How SparseTiles images leave the blocks without data: unbound (reads give zero), or all bound to
 // one zeroed block where the driver can't sample unbound memory (AMD) but lets blocks share
 // memory. EDEN_NX2_SPARSE_ALIASED=1 takes the shared block wherever it is supported, =0 never.
@@ -2030,6 +2059,10 @@ u64 TextureCacheRuntime::GetDeviceMemoryBudget() const {
     return device.GetDeviceMemoryBudget();
 }
 
+u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
+    return device.GetDeviceMemorySlack();
+}
+
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
@@ -2650,7 +2683,24 @@ bool Image::InitSparseLayers() {
     const u32 block_width = huge_astc ? 1 : VideoCore::Surface::DefaultBlockWidth(info.format);
     const u32 block_height = huge_astc ? 1 : VideoCore::Surface::DefaultBlockHeight(info.format);
     const u64 block_bytes = huge_astc ? 4 : VideoCore::Surface::BytesPerBlock(info.format);
-    const VkExtent3D granularity = it->formatProperties.imageGranularity;
+    VkExtent3D granularity = it->formatProperties.imageGranularity;
+    if (granularity.width == 0 || granularity.height == 0) {
+        // Seen with AMD's driver: the sparse block size comes back as 0, and the size computation
+        // below divided by it. Use the standard 2D block shape when the device promises it.
+        if (!StandardSparseBlockShape(device, block_bytes, granularity)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Sparse layered image {:#x}: the driver reports no sparse block size and "
+                        "no standard block shape; not using sparse layers",
+                        gpu_addr);
+            return false;
+        }
+        granularity.width *= block_width;
+        granularity.height *= block_height;
+        LOG_INFO(Render_Vulkan,
+                 "Sparse layered image {:#x}: no block size from the driver, using the standard "
+                 "{}x{} texel block",
+                 gpu_addr, granularity.width, granularity.height);
+    }
     s.tile_width = granularity.width;
     s.tile_height = granularity.height;
     const u64 tile = s.requirements.alignment;

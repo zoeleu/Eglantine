@@ -155,7 +155,46 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (use_safe) {
+        // The words as submitted, unless this is a resumed entry, an earlier entry wrote to it
+        // since (inline uploads, semaphores), or the GPU has newer ones the safe read below would
+        // flush (with the split, the front can't tell: it reads memory unflushed anyway).
+        bool submitted = command_resume_offset == 0 &&
+                         dma_pushbuffer_subindex < command_list.submitted_offsets.size();
+        if (submitted) {
+            using WriteResult = Common::CommandWriteLog::Result;
+            const WriteResult written = memory_manager.CommandMemoryWrittenSince(
+                dma_state.dma_get, header.size * sizeof(u32), command_list.submitted_write_sequence);
+            if (written != WriteResult::Unwritten) {
+                // Rewritten: memory holds the GPU's words (and maybe the next frame's). Past the
+                // log: no write was seen, and memory is likelier stale than the copy, so keep it.
+                static std::atomic<u64> rewritten{};
+                static std::atomic<u64> unknown{};
+                const u64 count = (written == WriteResult::Written ? rewritten : unknown)
+                                      .fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count <= 16 || count % 1000 == 0) {
+                    LOG_INFO(HW_GPU,
+                             "Command entry {:#x}: {} ({} read from memory, {} past the write "
+                             "log kept the copy)",
+                             u64{header.addr},
+                             written == WriteResult::Written
+                                 ? "the GPU wrote to it, read from memory"
+                                 : "the write log no longer reaches back, kept the copy",
+                             rewritten.load(std::memory_order_relaxed),
+                             unknown.load(std::memory_order_relaxed));
+                }
+                submitted = written != WriteResult::Written;
+            }
+        }
+        submitted = submitted && !(use_safe && memory_manager.IsMemoryDirty(
+                                                   dma_state.dma_get, header.size * sizeof(u32)));
+        if (submitted) {
+            const std::span<const CommandHeader> commands{
+                command_list.submitted_words.data() +
+                    command_list.submitted_offsets[dma_pushbuffer_subindex],
+                header.size};
+            RecordParsedEntry(header, commands);
+            command_resume_offset += ProcessCommands(commands, 0);
+        } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);

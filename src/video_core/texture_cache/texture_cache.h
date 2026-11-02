@@ -230,19 +230,57 @@ void TextureCache<P>::TickFrame() {
         // budget as the card fills (16 GB card: 13.5 GB left mid-race), hence the re-read every 30
         // frames. EDEN_NX2_TC_*_MIB overrides still win.
         if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+            if constexpr (requires { runtime.MemoryPressureEvents(); }) {
+                // Images that did not fit (made in host memory or with nothing bound) mean the
+                // thresholds sit too high for this card and driver: leave more room until the
+                // pressure has been gone for a while.
+                if (native_thresholds_applied) {
+                    const u32 events = runtime.MemoryPressureEvents();
+                    if (events != seen_pressure_events) {
+                        seen_pressure_events = events;
+                        pressure_margin = (std::min)(pressure_margin + 512_MiB, 3_GiB);
+                        pressure_quiet_frames = 0;
+                        budget_check_frames = 0; // thresholds are recomputed below
+                        LOG_WARNING(HW_GPU, "Out of device memory: keeping {} MiB more free",
+                                    pressure_margin >> 20);
+                    } else if (pressure_margin != 0 && ++pressure_quiet_frames % 600 == 0) {
+                        pressure_margin -= (std::min)(pressure_margin, 128_MiB);
+                        budget_check_frames = 0;
+                    }
+                }
+            }
             if (native_thresholds_applied && budget_check_frames++ % 30 == 0) {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
                 if (budget > 2_GiB) {
                     const u64 old_critical = critical_memory;
                     const u64 margin = (std::min)(budget / 8, 1_GiB);
-                    critical_memory = budget - margin;
-                    expected_memory = budget - 2 * margin;
+                    if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
+                        // The usage counted here leaves out the unused part of the allocator's
+                        // blocks, which the driver counts and a full heap cannot hand to a new
+                        // image (RX 7800 XT: 1.06 GiB of it, the whole margin, with the heap at
+                        // its budget for a minute before images stopped fitting). Reserve it
+                        // too: at once when it grows, slowly when it shrinks, so evicting images
+                        // (which leaves partly used blocks) does not chase the threshold down.
+                        const u64 slack = (std::min)(runtime.GetDeviceMemorySlack(), 1536_MiB);
+                        slack_margin = slack >= slack_margin
+                                           ? slack
+                                           : slack_margin - (std::min)(slack_margin - slack, 16_MiB);
+                    }
+                    critical_memory =
+                        budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
+                    expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time).
                     const u64 change = critical_memory > old_critical
                                            ? critical_memory - old_critical
                                            : old_critical - critical_memory;
-                    ApplyThresholdOverrides(budget_check_frames == 1 || change >= 256_MiB);
+                    const bool log = budget_check_frames == 1 || change >= 256_MiB;
+                    ApplyThresholdOverrides(log);
+                    if (log) {
+                        LOG_INFO(HW_GPU,
+                                 "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
+                                 margin >> 20, pressure_margin >> 20, slack_margin >> 20);
+                    }
                 }
             }
         }

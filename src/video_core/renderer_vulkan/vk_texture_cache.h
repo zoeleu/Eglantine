@@ -69,7 +69,14 @@ public:
 
     u64 GetDeviceMemoryBudget() const;
 
+    u64 GetDeviceMemorySlack() const;
+
     bool CanReportMemoryUsage() const;
+
+    /// Images that did not fit the device memory budget so far (see MemoryAllocator).
+    u32 MemoryPressureEvents() const noexcept {
+        return memory_allocator.MemoryPressureEvents();
+    }
 
     void LogMemoryStatistics() const;
 
