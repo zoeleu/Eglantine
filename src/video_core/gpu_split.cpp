@@ -234,30 +234,6 @@ void GpuSplit::Drain() {
     }
 }
 
-void GpuSplit::WaitForEffects() {
-    FlushRun(); // Constant buffer words still collected on the front write memory too
-    const u64 target = last_effect_end;
-    consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache >= target) {
-        return;
-    }
-    Publish();
-    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
-    wait_target.store(target, std::memory_order_seq_cst);
-    for (u32 spins = 0;; ++spins) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
-        if (consumed_cache >= target) {
-            break;
-        }
-        if (spins < 16384) {
-            Pause();
-        } else {
-            std::this_thread::yield();
-        }
-    }
-    wait_target.store(0, std::memory_order_relaxed);
-}
-
 void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
     front_engine = engine;
     u64* const entry = Reserve(2);
@@ -434,11 +410,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             Prefetch(&ring[(read_position + 64) & RingMask]);
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
-            // Hand ring space back now and then while working through a long batch, and at once
-            // past the entry the front waits for (WaitForEffects).
-            const u64 target = wait_target.load(std::memory_order_relaxed);
-            if ((read_position - last_store >= 4096 || (target != 0 && read_position >= target)) &&
-                read_position != available) {
+            // Hand ring space back now and then while working through a long batch.
+            if (read_position - last_store >= 4096 && read_position != available) {
                 consumed.store(read_position, std::memory_order_release);
                 last_store = read_position;
             }

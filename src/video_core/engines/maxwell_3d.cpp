@@ -1149,18 +1149,8 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                              u32 count) {
     // The words may be written by methods still queued for the back (indirect draw arguments
-    // from a culling dispatch), and the caches that may hold newer ones belong to it. Wait for
-    // the last queued entry that can write; flushing a cache needs the back idle.
-    // EDEN_NX2_DMA_READ_WAITFOR=0: always wait for everything queued.
-    static const bool wait_for_effects = [] {
-        const char* value = std::getenv("EDEN_NX2_DMA_READ_WAITFOR");
-        return value == nullptr || value[0] != '0';
-    }();
-    if (wait_for_effects) {
-        split.WaitForEffects();
-    } else {
-        split.Drain();
-    }
+    // from a culling dispatch), and the caches that may hold newer ones belong to it.
+    split.Drain();
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
@@ -1168,9 +1158,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
-        split.Drain();
-        memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+    // Query reports too (occlusion-based conditional rendering, see MacroEngine::Execute);
+    // the back is drained, so its caches are safe to flush from here.
+    constexpr auto flush_caches = VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache;
+    if (memory_manager.IsMemoryDirty(source, read_bytes, flush_caches)) {
+        memory_manager.FlushRegion(source, read_bytes, flush_caches);
     }
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
