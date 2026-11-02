@@ -304,6 +304,7 @@ void ShaderCache::RemovePendingShaders() {
     removals_pending.store(false, std::memory_order_release);
 
     if (!removed_shaders.empty()) {
+        shader_removals.fetch_add(1, std::memory_order_release);
         // Remove the given shaders from the cache
         std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
             return std::ranges::find(removed_shaders, shader.get()) != removed_shaders.end();

@@ -103,6 +103,10 @@ protected:
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
 
+    /// Bumped whenever shaders are removed: pointers to ShaderInfo or lookups cached under an
+    /// older value may be stale.
+    std::atomic<u64> shader_removals{};
+
 private:
     /// @brief Tries to obtain a cached shader starting in a given address
     /// @note Doesn't check for ranges, the given address has to be the start of the shader
