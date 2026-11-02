@@ -59,6 +59,9 @@ enum class Zone : u32 {
     Method,       ///< Engine method calls; on a split's back thread, the whole ring batch
     SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h)
     SplitWait,    ///< Split GPU thread: the back waits for work
+    FlushCaching, ///< Pre-draw invalidation of ranges written since the last draw
+    DispatchWork, ///< Scheduler chunks handed to the worker every 32 draws
+    SchedulerFlush, ///< Scheduler flushes every 4096 draws
     Count,
 };
 
@@ -69,7 +72,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "sync descriptors", "read handles", "fill image views", "texture buffers", "update buffers",
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
-    "fence skipped", "method", "split drain", "split wait",
+    "fence skipped", "method", "split drain", "split wait", "flush caching",
+    "dispatch work", "scheduler flush",
 };
 
 // Read once at startup: Enabled() runs several times per method write (no guard to check).
@@ -97,7 +101,7 @@ inline u64 WallNs() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ticks{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 12> counters{}; ///< See Counter
+    std::array<u64, 16> counters{}; ///< See Counter
     u64 child_ticks{}; ///< Time of the zones nested in the current one
     u64 window_start{};    ///< Now() at the window's start
     u64 window_start_ns{}; ///< WallNs() at the window's start
@@ -152,6 +156,10 @@ enum class Counter : u32 {
     AcquireMetEarly, ///< Acquires met without the front draining the back
     AcquireMetDrained, ///< Acquires met after the front drained the back
     AcquireDrainsAvoided, ///< Resume checks that returned while the back was busy
+    UploadsAccelerated, ///< Image uploads swizzled on the host GPU
+    UploadsUnswizzled,  ///< Image uploads unswizzled on the CPU
+    UploadsConverted,   ///< Of UploadsUnswizzled: also converted on the CPU (ASTC, BCn, ...)
+    StagingCreations,   ///< Staging buffers made because the stream buffer's regions were busy
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -221,6 +229,12 @@ inline void Report(const char* thread_name = "GPU thread") {
                         static_cast<double>(data.counters[9]) * 1e9 / window,
                         static_cast<double>(data.counters[10]) * 1e9 / window,
                         static_cast<double>(data.counters[11]) * 1e9 / window);
+    line += fmt::format(" | image uploads: {:.0f} accelerated, {:.0f} CPU unswizzle ({:.0f} "
+                        "converted) | staging buffers made {:.0f}",
+                        static_cast<double>(data.counters[12]) * 1e9 / window,
+                        static_cast<double>(data.counters[13]) * 1e9 / window,
+                        static_cast<double>(data.counters[14]) * 1e9 / window,
+                        static_cast<double>(data.counters[15]) * 1e9 / window);
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     data = {};
     data.window_start = now;

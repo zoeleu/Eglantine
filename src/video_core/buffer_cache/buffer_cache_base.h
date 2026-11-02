@@ -117,6 +117,29 @@ struct HostBindings {
     u32 max_index{0};
 };
 
+/// A binding as last synchronized (BufferCache::SynchronizeBinding): while the same buffer and
+/// range see no CPU modification and no buffer is created or deleted, there is nothing to upload.
+struct SyncedBinding {
+    BufferId buffer_id{};
+    DAddr device_addr{};
+    u32 size{};
+    u64 buffers_generation{~u64{}};
+    u64 mark_sequence{};
+};
+
+/// A storage buffer descriptor as last resolved (BindGraphicsStorageBuffer): reused while the
+/// descriptor words and the address space's mappings are unchanged.
+struct ResolvedStorageBuffer {
+    GPUVAddr ssbo_addr{};
+    std::array<u64, 2> words{};
+    size_t memory_manager_id{~size_t{}};
+    u64 map_generation{};
+    bool is_written{};
+    Binding binding{};
+    BufferId found_buffer_id{}; ///< FindBuffer's answer for `binding`, at buffers_generation
+    u64 buffers_generation{~u64{}};
+};
+
 class BufferCacheChannelInfo : public ChannelInfo {
 public:
     BufferCacheChannelInfo() = delete;
@@ -132,6 +155,12 @@ public:
     std::array<Binding, NUM_TRANSFORM_FEEDBACK_BUFFERS> transform_feedback_buffers;
     Binding count_buffer_binding;
     Binding indirect_buffer_binding;
+
+    SyncedBinding synced_index_buffer;
+    std::array<SyncedBinding, NUM_VERTEX_BUFFERS> synced_vertex_buffers;
+    std::array<std::array<SyncedBinding, NUM_STORAGE_BUFFERS>, NUM_STAGES> synced_storage_buffers;
+    std::array<std::array<ResolvedStorageBuffer, NUM_STORAGE_BUFFERS>, NUM_STAGES>
+        resolved_storage_buffers;
 
     std::array<Binding, NUM_COMPUTE_UNIFORM_BUFFERS> compute_uniform_buffers;
     std::array<Binding, NUM_STORAGE_BUFFERS> compute_storage_buffers;
@@ -350,6 +379,7 @@ public:
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
+    u64 buffers_generation = 0; ///< Bumped whenever a buffer is registered or unregistered
 
 private:
     template <typename Func>
@@ -461,6 +491,10 @@ private:
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
 
     bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
+
+    /// SynchronizeBuffer for a draw binding, skipped while `synced` shows nothing new to upload.
+    void SynchronizeBinding(SyncedBinding& synced, Buffer& buffer, BufferId buffer_id,
+                            DAddr device_addr, u32 size);
 
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);

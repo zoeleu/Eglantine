@@ -30,6 +30,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_draw_cache.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -589,12 +590,24 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline() {
-
+    const auto& qmd{kepler_compute->launch_description};
+    const GPUVAddr shader_addr{kepler_compute->regs.code_loc.Address() + qmd.program_start};
+    const std::array<u32, 3> workgroup_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z};
+    const size_t memory_manager_id{gpu_memory->GetID()};
+    const u64 map_generation{gpu_memory->MapGeneration()};
+    const u64 removals{shader_removals.load(std::memory_order_acquire)};
+    if (VideoCommon::g_draw_cache && last_compute.pipeline &&
+        last_compute.shader_addr == shader_addr &&
+        last_compute.shared_memory_size == qmd.shared_alloc &&
+        last_compute.workgroup_size == workgroup_size &&
+        last_compute.memory_manager_id == memory_manager_id &&
+        last_compute.map_generation == map_generation && last_compute.shader_removals == removals) {
+        return last_compute.pipeline;
+    }
     const ShaderInfo* const shader{ComputeShader()};
     if (!shader) {
         return nullptr;
     }
-    const auto& qmd{kepler_compute->launch_description};
     const ComputePipelineCacheKey key{
         .unique_hash = shader->unique_hash,
         .shared_memory_size = qmd.shared_alloc,
@@ -602,10 +615,18 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     };
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& pipeline{pair->second};
-    if (!is_new) {
-        return pipeline.get();
+    if (is_new) {
+        pipeline = CreateComputePipeline(key, shader);
     }
-    pipeline = CreateComputePipeline(key, shader);
+    last_compute = {
+        .shader_addr = shader_addr,
+        .shared_memory_size = qmd.shared_alloc,
+        .workgroup_size = workgroup_size,
+        .memory_manager_id = memory_manager_id,
+        .map_generation = map_generation,
+        .shader_removals = removals,
+        .pipeline = pipeline.get(),
+    };
     return pipeline.get();
 }
 

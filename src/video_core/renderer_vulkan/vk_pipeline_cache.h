@@ -163,6 +163,18 @@ private:
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
 
+    /// The last compute pipeline and what selected it: dispatches in a row usually launch the
+    /// same program, and looking it up took an address translation and two hash lookups.
+    struct LastCompute {
+        GPUVAddr shader_addr{};
+        u32 shared_memory_size{};
+        std::array<u32, 3> workgroup_size{};
+        size_t memory_manager_id{~size_t{}};
+        u64 map_generation{};
+        u64 shader_removals{};
+        ComputePipeline* pipeline{};
+    } last_compute;
+
     ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>> compute_cache;
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 

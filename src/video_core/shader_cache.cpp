@@ -23,19 +23,40 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_draw_cache.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
 
+bool ShaderCache::OutsideTrackedRange(VAddr addr, size_t size) const {
+    if (!g_draw_cache) {
+        return false;
+    }
+    const VAddr addr_end = addr + size;
+    const auto outside = [&](const std::atomic<VAddr>& lowest, const std::atomic<VAddr>& highest) {
+        return addr_end <= lowest.load(std::memory_order_acquire) ||
+               addr > highest.load(std::memory_order_acquire);
+    };
+    return outside(registered_lowest, registered_highest) &&
+           outside(rejected_lowest, rejected_highest);
+}
+
 void ShaderCache::InvalidateRegion(VAddr addr, size_t size) {
+    // Runs for every range written since the last draw, mostly constant buffer data.
+    if (OutsideTrackedRange(addr, size) && !removals_pending.load(std::memory_order_acquire)) {
+        return;
+    }
     std::scoped_lock lock{invalidation_mutex};
     InvalidatePagesInRegion(addr, size);
     RemovePendingShaders();
 }
 
 void ShaderCache::OnCacheInvalidation(VAddr addr, size_t size) {
+    if (OutsideTrackedRange(addr, size)) {
+        return;
+    }
     std::scoped_lock lock{invalidation_mutex};
     InvalidatePagesInRegion(addr, size);
 }
@@ -232,6 +253,11 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t 
     }
 
     storage.push_back(std::move(data));
+    registered_lowest.store((std::min)(registered_lowest.load(std::memory_order_relaxed), addr),
+                            std::memory_order_release);
+    registered_highest.store(
+        (std::max)(registered_highest.load(std::memory_order_relaxed), addr_end),
+        std::memory_order_release);
 
     device_memory.UpdatePagesCachedCount(addr, size, 1);
 }
@@ -275,8 +301,10 @@ void ShaderCache::RemovePendingShaders() {
         lookup_cache.erase(it);
     }
     marked_for_removal.clear();
+    removals_pending.store(false, std::memory_order_release);
 
     if (!removed_shaders.empty()) {
+        shader_removals.fetch_add(1, std::memory_order_release);
         // Remove the given shaders from the cache
         std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
             return std::ranges::find(removed_shaders, shader.get()) != removed_shaders.end();
@@ -296,6 +324,7 @@ void ShaderCache::InvalidatePageEntries(std::vector<Entry*>& entries, VAddr addr
         UnmarkMemory(entry);
         RemoveEntryFromInvalidationCache(entry);
         marked_for_removal.push_back(entry);
+        removals_pending.store(true, std::memory_order_release);
     }
 }
 

@@ -16,6 +16,7 @@
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/guest_memory.h"
+#include "video_core/nx2_draw_cache.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/texture_cache/util.h"
@@ -504,9 +505,32 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
 
     const auto& cbufs = maxwell3d->state.shader_stages[stage];
     const GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
-    channel_state->storage_buffers[stage][ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
-    return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
+    Binding& binding = channel_state->storage_buffers[stage][ssbo_index];
+    if (g_draw_cache) {
+        // Resolving takes a mapping lookup under the memory manager's mutex and two address
+        // translations, for the same descriptor draw after draw.
+        auto& resolved = channel_state->resolved_storage_buffers[stage][ssbo_index];
+        const std::array<u64, 2> words{gpu_memory->Read<u64>(ssbo_addr),
+                                       gpu_memory->Read<u64>(ssbo_addr + 8)};
+        const size_t memory_manager_id = gpu_memory->GetID();
+        const u64 map_generation = gpu_memory->MapGeneration();
+        if (resolved.ssbo_addr != ssbo_addr || resolved.words != words ||
+            resolved.memory_manager_id != memory_manager_id ||
+            resolved.map_generation != map_generation || resolved.is_written != is_written) {
+            resolved = {
+                .ssbo_addr = ssbo_addr,
+                .words = words,
+                .memory_manager_id = memory_manager_id,
+                .map_generation = map_generation,
+                .is_written = is_written,
+                .binding = StorageBufferBinding(ssbo_addr, cbuf_index, is_written),
+            };
+        }
+        binding = resolved.binding;
+    } else {
+        binding = StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
+    }
+    return (binding.buffer_id != NULL_BUFFER_ID);
 }
 
 template <class P>
@@ -814,8 +838,12 @@ void BufferCache<P>::BindHostIndexBuffer() {
     const u32 size = channel_state->index_buffer.size;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     if (draw_state.inline_index_draw_indexes.empty()) {
-        SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
+        SynchronizeBinding(channel_state->synced_index_buffer, buffer,
+                           channel_state->index_buffer.buffer_id,
+                           channel_state->index_buffer.device_addr, size);
     } else {
+        // The inline indices overwrite the buffer without the tracker knowing.
+        channel_state->synced_index_buffer = {};
         if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
             auto upload_staging = runtime.UploadStagingBuffer(size);
             std::array<BufferCopy, 1> copies{{BufferCopy{.src_offset = upload_staging.offset, .dst_offset = 0, .size = size}}};
@@ -899,7 +927,8 @@ void BufferCache<P>::BindHostVertexBuffers() {
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
-            SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            SynchronizeBinding(channel_state->synced_vertex_buffers[index], buffer,
+                               binding.buffer_id, binding.device_addr, binding.size);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
                 continue;
@@ -1152,7 +1181,8 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
-        SynchronizeBuffer(buffer, binding.device_addr, size);
+        SynchronizeBinding(channel_state->synced_storage_buffers[stage][index], buffer,
+                           binding.buffer_id, binding.device_addr, size);
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
@@ -1514,8 +1544,18 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         // Resolve buffer
         Binding& binding = channel_state->storage_buffers[stage][index];
-        const BufferId buffer_id = FindBuffer(binding.device_addr, binding.size, false);
-        binding.buffer_id = buffer_id;
+        auto& resolved = channel_state->resolved_storage_buffers[stage][index];
+        // FindBuffer synchronizes buffer writes in accurate mode, so it runs every time there.
+        if (g_draw_cache && !Settings::IsGPUFenceBehaviorAccurate() &&
+            resolved.buffers_generation == buffers_generation &&
+            resolved.binding.device_addr == binding.device_addr &&
+            resolved.binding.size == binding.size) {
+            binding.buffer_id = resolved.found_buffer_id;
+        } else {
+            binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
+            resolved.found_buffer_id = binding.buffer_id;
+            resolved.buffers_generation = buffers_generation;
+        }
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
         ResolveMultiRangeStorage(binding, is_written, graphics_segments);
     });
@@ -1787,6 +1827,7 @@ void BufferCache<P>::Unregister(BufferId buffer_id) {
 template <class P>
 template <bool insert>
 void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
+    ++buffers_generation;
     Buffer& buffer = slot_buffers[buffer_id];
     const auto size = buffer.SizeBytes();
     if (insert) {
@@ -1878,6 +1919,26 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
         return false;
     }
+}
+
+template <class P>
+void BufferCache<P>::SynchronizeBinding(SyncedBinding& synced, Buffer& buffer, BufferId buffer_id,
+                                        DAddr device_addr, u32 size) {
+    if (g_draw_cache && synced.buffer_id == buffer_id && synced.device_addr == device_addr &&
+        synced.size == size && synced.buffers_generation == buffers_generation &&
+        !memory_tracker.CpuMarkedSince(device_addr, size, synced.mark_sequence)) {
+        return;
+    }
+    // Read before: a mark during the upload (none are expected) still shows up next time.
+    const u64 mark_sequence = memory_tracker.CpuMarkSequence();
+    SynchronizeBuffer(buffer, device_addr, size);
+    synced = {
+        .buffer_id = buffer_id,
+        .device_addr = device_addr,
+        .size = size,
+        .buffers_generation = buffers_generation,
+        .mark_sequence = mark_sequence,
+    };
 }
 
 template <class P>

@@ -29,6 +29,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+#include "video_core/nx2_draw_cache.h"
 #include "video_core/nx2_profile.h"
 
 #if defined(__clang__) && defined(NDEBUG)
@@ -281,6 +282,7 @@ GraphicsPipeline::GraphicsPipeline(
         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
+    last_descriptor_payload.resize(num_descriptor_entries);
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
 
     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
@@ -381,26 +383,44 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+        // Each handle read walked the page tables (MemoryManager::Read); resolve each constant
+        // buffer the stage reads handles from to host memory once instead, when contiguous.
+        std::array<const u8*, Maxwell::MaxConstBuffers> cbuf_spans{};
+        std::array<bool, Maxwell::MaxConstBuffers> cbuf_resolved{};
+        const auto read_word{[&](u32 cbuf_index, u32 offset) -> u32 {
+            const auto& cbuf = cbufs[cbuf_index];
+            if (VideoCommon::g_draw_cache && offset + sizeof(u32) <= cbuf.size) {
+                if (!cbuf_resolved[cbuf_index]) {
+                    cbuf_resolved[cbuf_index] = true;
+                    if (!gpu_memory->OverlapsSyncpointShim(cbuf.address, cbuf.size)) {
+                        cbuf_spans[cbuf_index] = gpu_memory->GetSpan(cbuf.address, cbuf.size);
+                    }
+                }
+                if (const u8* const span = cbuf_spans[cbuf_index]) {
+                    u32 value;
+                    std::memcpy(&value, span + offset, sizeof(value));
+                    return value;
+                }
+            }
+            return gpu_memory->Read<u32>(cbuf.address + offset);
+        }};
         const auto read_handle{[&](const auto& desc, u32 index) {
             ASSERT(cbufs[desc.cbuf_index].enabled);
             const u32 index_offset{index << desc.size_shift};
             const u32 offset{desc.cbuf_offset + index_offset};
-            const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
             if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
                           std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
                 if (desc.has_secondary) {
                     ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
                     const u32 second_offset{desc.secondary_cbuf_offset + index_offset};
-                    const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
-                                                 second_offset};
-                    const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
+                    const u32 lhs_raw{read_word(desc.cbuf_index, offset) << desc.shift_left};
+                    const u32 rhs_raw{read_word(desc.secondary_cbuf_index, second_offset)
                                       << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
                     return TexturePair(raw, via_header_index);
                 }
             }
-            return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
+            return TexturePair(read_word(desc.cbuf_index, offset), via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
@@ -607,7 +627,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         const bool reuse_allocation =
             last_descriptor_buffer_generation == descriptor_buffer_ring.CurrentGeneration() &&
-            last_descriptor_payload.size() == num_descriptor_entries &&
+            has_last_descriptor_payload &&
             std::memcmp(last_descriptor_payload.data(), entries,
                         num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0;
         if (reuse_allocation) {
@@ -627,7 +647,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             last_descriptor_buffer_offset = alloc.offset;
             last_descriptor_buffer_chunk = alloc.chunk;
             last_descriptor_buffer_generation = alloc.generation;
-            last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+            std::copy_n(entries, num_descriptor_entries, last_descriptor_payload.data());
+            has_last_descriptor_payload = true;
         }
     }
 
@@ -657,11 +678,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (descriptor_set_layout && !uses_push_descriptor && !uses_descriptor_buffer) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         update_descriptors =
-            bind_pipeline || last_descriptor_payload.size() != num_descriptor_entries ||
+            bind_pipeline || !has_last_descriptor_payload ||
             std::memcmp(last_descriptor_payload.data(), entries,
                         num_descriptor_entries * sizeof(DescriptorUpdateEntry)) != 0;
         if (update_descriptors) {
-            last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+            std::copy_n(entries, num_descriptor_entries, last_descriptor_payload.data());
+            has_last_descriptor_payload = true;
         }
     }
     scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
