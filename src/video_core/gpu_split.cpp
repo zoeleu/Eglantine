@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <new>
 #include <cstdlib>
 #include <thread>
 
@@ -278,11 +279,21 @@ void GpuSplit::FlushRunSlow() {
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
-    auto* const heap = new std::function<void()>(std::move(func));
-    Defer([heap] {
-        (*heap)();
-        delete heap;
+    // Moved into the entry itself (not trivially copyable, unlike what Defer takes): the back
+    // calls and destroys it there, and nothing else reads the entry once it ran.
+    using Function = std::function<void()>;
+    static_assert(alignof(Function) <= alignof(u64));
+    constexpr size_t payload = (sizeof(Function) + sizeof(u64) - 1) / sizeof(u64);
+    FlushRun();
+    u64* const entry = Reserve(2 + payload);
+    entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+    entry[1] = reinterpret_cast<u64>(+[](const u64* data) {
+        auto* const function = std::launder(reinterpret_cast<Function*>(const_cast<u64*>(data)));
+        (*function)();
+        function->~Function();
     });
+    new (entry + 2) Function(std::move(func));
+    Commit(2 + payload);
 }
 
 void GpuSplit::CallBackMethod(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
