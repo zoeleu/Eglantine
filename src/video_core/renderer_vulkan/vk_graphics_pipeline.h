@@ -177,7 +177,9 @@ private:
     vk::Pipeline pipeline;
 
     DescriptorBufferLayout descriptor_buffer_layout;
+    /// Sized once (num_descriptor_entries) so draws only copy into it; valid once filled.
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+    bool has_last_descriptor_payload{};
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
