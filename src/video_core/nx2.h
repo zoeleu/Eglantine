@@ -279,11 +279,33 @@ public:
         return waiters;
     }
 
-    void Add(const void* owner, u64 device_address, u32 value, u32 operation) {
+    /// `armed` false: writes don't count until Arm (a split's back thread has not reached the
+    /// acquire yet, and writes queued before it must not latch it).
+    void Add(const void* owner, u64 device_address, u32 value, u32 operation, bool armed = true) {
         std::scoped_lock lk{mutex};
         std::erase_if(waiters, [owner](const Waiter& w) { return w.owner == owner; });
-        waiters.push_back({owner, device_address, value, operation, false});
+        waiters.push_back({owner, device_address, value, operation, false, armed});
         count.store(waiters.size(), std::memory_order_release);
+    }
+
+    /// The back reached the acquire of a waiter added unarmed; `met`: the value held there.
+    void Arm(const void* owner, bool met) {
+        std::scoped_lock lk{mutex};
+        for (auto& w : waiters) {
+            if (w.owner == owner) {
+                w.armed = true;
+                w.latched = w.latched || met;
+            }
+        }
+    }
+
+    [[nodiscard]] bool Armed(const void* owner) {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return true;
+        }
+        std::scoped_lock lk{mutex};
+        return std::ranges::none_of(waiters,
+                                    [owner](const Waiter& w) { return w.owner == owner && !w.armed; });
     }
 
     void Remove(const void* owner) {
@@ -311,7 +333,7 @@ public:
         }
         std::scoped_lock lk{mutex};
         for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
+            if (w.address == device_address && w.armed && !w.latched && Matches(w, value)) {
                 w.latched = true;
             }
         }
@@ -324,6 +346,7 @@ private:
         u32 value;
         u32 operation;
         bool latched;
+        bool armed;
     };
 
     static bool Matches(const Waiter& w, u32 current) {

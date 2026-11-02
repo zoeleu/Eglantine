@@ -79,6 +79,8 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         bool reported;
+        bool deferred{};  ///< Checked on the split's back thread once it reaches the acquire
+        bool confirmed{}; ///< Met: ResumeAcquire doesn't check again
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
@@ -87,6 +89,8 @@ public:
         return pending_acquire.has_value();
     }
     [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
+    /// Split GPU thread with its back busy: suspends on `acquire` and checks it on the back.
+    bool DeferAcquire(DmaPusher& dma_pusher, PendingAcquire acquire);
     /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
     bool ResumeAcquire(DmaPusher& dma_pusher);
 

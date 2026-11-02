@@ -99,6 +99,11 @@ public:
     void Publish();
     /// Waits until the back executed everything sent so far.
     void Drain();
+    /// Whether the back executed everything sent so far (front thread only).
+    [[nodiscard]] bool Idle() {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        return consumed_cache == write_position;
+    }
 
 private:
     enum class Kind : u64 {

@@ -97,7 +97,7 @@ inline u64 WallNs() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ticks{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, 12> counters{}; ///< See Counter
     u64 child_ticks{}; ///< Time of the zones nested in the current one
     u64 window_start{};    ///< Now() at the window's start
     u64 window_start_ns{}; ///< WallNs() at the window's start
@@ -148,6 +148,10 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    AcquireDeferred, ///< Of AcquireChecks: checked on the split's back thread, not drained
+    AcquireMetEarly, ///< Acquires met without the front draining the back
+    AcquireMetDrained, ///< Acquires met after the front drained the back
+    AcquireDrainsAvoided, ///< Resume checks that returned while the back was busy
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -209,9 +213,14 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | 3D register writes {:.0f} ({:.0f} same value)",
                         static_cast<double>(data.counters[4]) * 1e9 / window,
                         static_cast<double>(data.counters[5]) * 1e9 / window);
-    line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
+    line += fmt::format(" | acquires {:.0f} ({:.0f} waited, {:.0f} deferred to the back; met "
+                        "{:.0f} without a drain, {:.0f} after one; {:.0f} drains avoided)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
-                        static_cast<double>(data.counters[7]) * 1e9 / window);
+                        static_cast<double>(data.counters[7]) * 1e9 / window,
+                        static_cast<double>(data.counters[8]) * 1e9 / window,
+                        static_cast<double>(data.counters[9]) * 1e9 / window,
+                        static_cast<double>(data.counters[10]) * 1e9 / window,
+                        static_cast<double>(data.counters[11]) * 1e9 / window);
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     data = {};
     data.window_start = now;
