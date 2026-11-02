@@ -20,6 +20,9 @@ add_executable(tests
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
     video_core/ampere_returns.cpp
+    video_core/ampere_integer_multiply.cpp
+    video_core/ampere_program_override.cpp
+    video_core/x8d24_conversion.cpp
     input_common/calibration_configuration_job.cpp
 )
 
