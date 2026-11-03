@@ -87,7 +87,8 @@ TEST_CASE("Ampere byte F2I rejects other widths, rounding, modifiers and registe
         invalid[0].words[1] = source;
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
     }
-    for (const u32 source : {28U, 62U, 64U, 216U}) {
+    // UR28-UR62 are mirrored below R216.
+    for (const u32 source : {64U, 216U}) {
         auto invalid = code;
         invalid[0].words = {0x00157d05, source, 0x0821e100, 0x0001e400};
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
@@ -279,7 +280,8 @@ TEST_CASE("Ampere uniform votes reject unmapped registers and unsupported fields
         {{0x00107886, 0, 0x038e0100, 0x000fe400}},
         {{0x0000794d, 0, 0x03800000, 0}},
     }};
-    for (const u32 target : {28U, 62U, 64U}) {
+    // UR28-UR62 are mirrored below R216.
+    for (const u32 target : {64U}) {
         auto invalid = code;
         invalid[0].words[0] = 0x00007886U | (target << 16);
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
@@ -689,7 +691,8 @@ TEST_CASE("Ampere half explicit texel fetches keep unsupported formats and regis
         {{0x04047b66, 0x33c0440e, 0x059e8705, 0x002f4200}},
         {{0x0000794d, 0, 0x03800000, 0}},
     }};
-    for (const u32 bit : {59U, 60U, 62U, 76U, 77U, 78U, 80U, 81U, 91U}) {
+    // Bits 76 (a texel offset) and 91 leave this form for the general TLD lowering.
+    for (const u32 bit : {59U, 60U, 62U, 77U, 78U, 80U, 81U}) {
         auto invalid = code;
         invalid[0].words[bit / 32] ^= 1U << (bit % 32);
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));

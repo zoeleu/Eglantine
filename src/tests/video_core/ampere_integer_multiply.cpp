@@ -66,6 +66,10 @@ struct IntegerMachine {
                 result = (a >> offset) & 0xff;
                 if (bits(48, 1) && (result & 0x80))
                     result |= 0xffffff00;
+            } else if (opcode == 0x5ca0000000000000ULL) {
+                const u32 pred = bits(39, 3);
+                const bool selected = (pred == 7 || predicates[pred]) != bool(bits(42, 1));
+                result = selected ? a : b;
             } else if (opcode == 0x5c98000000000000ULL) {
                 result = b;
             } else if ((word >> 56) == 0x01) {
@@ -276,5 +280,32 @@ TEST_CASE("Ampere integer multiplication rejects unsupported modifiers",
     for (const u32 bit : {8U, 11U, 13U, 15U}) {
         const Instruction invalid{{0x02007226, 4, 6U | (1U << bit), 0}};
         REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+    }
+}
+
+TEST_CASE("Ampere immediate IMAD.X preserves multiplication and predicate carry",
+          "[video_core][ampere][integer_multiply]") {
+    for (const u32 multiplier : {1U, 3U, 0x12345678U, ~0U}) {
+        for (const u32 dest : {0U, 2U, 6U}) {
+            for (const u32 pred : {0U, 1U, 7U}) {
+                for (const bool negate : {false, true}) {
+                    auto machine = SeedMachine();
+                    machine.registers[2] = 0x87654321;
+                    machine.registers[6] = 0xfedcba98;
+                    const auto before = machine;
+                    const Instruction instruction{
+                        {0x02007824U | (dest << 16), multiplier,
+                         0x000e0406U | (pred << 23) | (u32{negate} << 26), 0}};
+                    const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+                    INFO(lowered.error);
+                    REQUIRE(lowered);
+                    machine.Run(lowered.instructions);
+                    const u32 carry = (pred == 7 || before.predicates[pred]) != negate;
+                    REQUIRE(machine.Read(dest) ==
+                            before.Read(2) * multiplier + before.Read(6) + carry);
+                    CheckUnchanged(before, machine, dest, 1);
+                }
+            }
+        }
     }
 }
