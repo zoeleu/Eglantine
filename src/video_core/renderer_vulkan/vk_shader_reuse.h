@@ -127,6 +127,8 @@ private:
     struct Properties {
         std::array<u32, sizeof(Shader::ProgramHeader) / sizeof(u32)> sph;
         std::array<u32, 8> gp_passthrough_mask; ///< Geometry programs only.
+        std::array<u32, 3> mesh_registers;      ///< Task and mesh programs only.
+        std::array<u32, sizeof(Shader::ProgramHeader) / sizeof(u32)> mesh_primitive_header;
         std::array<u32, 3> workgroup_size;
         Shader::Stage stage;
         u32 start_address;

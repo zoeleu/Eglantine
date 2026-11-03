@@ -50,6 +50,11 @@ TranslationReads::Properties TranslationReads::PropertiesOf(const Shader::Enviro
     if (env.ShaderStage() == Shader::Stage::Geometry) {
         result.gp_passthrough_mask = env.GpPassthroughMask();
     }
+    if (env.ShaderStage() == Shader::Stage::Task || env.ShaderStage() == Shader::Stage::Mesh) {
+        result.mesh_registers = env.MeshRegisters();
+        std::memcpy(result.mesh_primitive_header.data(), &env.MeshPrimitiveHeader(),
+                    sizeof(result.mesh_primitive_header));
+    }
     result.workgroup_size = env.WorkgroupSize();
     result.stage = env.ShaderStage();
     result.start_address = env.StartAddress();
@@ -92,6 +97,8 @@ RecordingEnvironment::RecordingEnvironment(Shader::Environment& inner_) : inner{
     // Shader::Environment's own accessors read these members.
     sph = inner->SPH();
     gp_passthrough_mask = inner->GpPassthroughMask();
+    mesh_registers = inner->MeshRegisters();
+    mesh_primitive_header = inner->MeshPrimitiveHeader();
     stage = inner->ShaderStage();
     start_address = inner->StartAddress();
     is_proprietary_driver = inner->IsProprietaryDriver();

@@ -169,6 +169,7 @@ private:
     std::unique_ptr<GraphicsPipeline> AdoptTranslatedGraphicsPipeline(
         std::future<TranslatedGraphicsPipeline>& translated);
 
+    /// Queues the pipeline for the disk cache, unless it is in it already or can't be stored.
     void SerializeGraphicsPipeline(const GraphicsPipeline& pipeline,
                                    const GraphicsPipelineCacheKey& key,
                                    GraphicsEnvironmentArray envs);

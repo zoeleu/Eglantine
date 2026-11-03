@@ -629,8 +629,12 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
     const size_t page_end = Common::DivCeil(addr + size, Memory::YUZU_PAGESIZE);
     size_t page = addr >> Memory::YUZU_PAGEBITS;
     auto [asid, base_vaddress] = ExtractCPUBacking(page);
-    auto* memory_device_inter =
-        asid.id < registered_processes.size() ? registered_processes[asid.id] : nullptr;
+    // Sem processo registrado nao ha o que marcar, e asid.id 0 indexaria um vetor vazio. Acontece
+    // no alvo de testes, que chama UpdatePagesCachedBatch num DeviceMemoryManager recem-criado.
+    if (asid.id >= registered_processes.size()) {
+        return;
+    }
+    auto* memory_device_inter = registered_processes[asid.id];
     const auto release_pending = [&] {
         if (uncache_bytes > 0) {
             if (memory_device_inter != nullptr) {
