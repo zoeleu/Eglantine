@@ -367,12 +367,11 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     return info;
 }
 
-// EDEN_NX2_SHADER_REUSE=1: graphics pipelines reuse the shaders of an earlier one when they fit
-// (vk_shader_reuse.h). Off by default until it has been checked in game; otherwise every
-// pipeline translates its own shaders.
+// Graphics pipelines reuse the shaders of an earlier one when they fit (vk_shader_reuse.h).
+// EDEN_NX2_SHADER_REUSE=0: every pipeline translates its own shaders.
 bool IsShaderReuseAllowed() {
     const char* const value = std::getenv("EDEN_NX2_SHADER_REUSE");
-    return value != nullptr && value[0] == '1';
+    return value == nullptr || value[0] != '0';
 }
 
 size_t GetTotalPipelineWorkers() {
@@ -391,12 +390,11 @@ size_t GetTotalPipelineWorkers() {
 #endif
 }
 
-// EDEN_NX2_ASYNC_TRANSLATION=1: with asynchronous shaders on, native graphics pipelines are
-// translated on worker threads. Off by default until it has been checked in game; otherwise
-// they are translated on the GPU thread.
+// With asynchronous shaders on, native graphics pipelines are translated on worker threads.
+// EDEN_NX2_ASYNC_TRANSLATION=0: they are translated on the GPU thread.
 bool IsAsyncTranslationAllowed() {
     const char* const value = std::getenv("EDEN_NX2_ASYNC_TRANSLATION");
-    return value != nullptr && value[0] == '1';
+    return value == nullptr || value[0] != '0';
 }
 
 // Translation threads also run the driver compile of what they translate. They get half of the
@@ -479,7 +477,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                  num_translation_threads);
     }
     LOG_INFO(Render_Vulkan, "Graphics pipelines {} the shaders of earlier pipelines that fit them",
-             use_shader_reuse ? "reuse" : "do not reuse (EDEN_NX2_SHADER_REUSE=1 enables)");
+             use_shader_reuse ? "reuse" : "do not reuse (EDEN_NX2_SHADER_REUSE=0)");
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
