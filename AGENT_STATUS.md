@@ -20,11 +20,10 @@ Untracked notes file, do not commit. Last updated 2026-11-02.
   Old profile numbers are inflated by fenced clock reads (fixed in ca32ec64c5).
 
 ## In progress: back-thread performance (all unpushed)
-Base branch perf/back-thread in this checkout (/home/zoe/Projects/Eglantine):
-- ca32ec64c5 profiler: unfenced TSC, one zone per back batch (committed, builds)
-- UNCOMMITTED: src/common/command_write_log.h alignas(64) on `sequence` and `mutex`
-  (cache-line separation). Build was running; check `ninja -C build` then commit with
-  "Assisted-by: Claude Opus 5.5 (back thread optimization)".
+Base branch perf/back-thread in this checkout (/home/zoe/Projects/Eglantine), PUSHED by the
+user to origin/perf/back-thread:
+- ca32ec64c5 profiler: unfenced TSC, one zone per back batch
+- 9c82b9487e command write log: sequence and mutex on their own cache lines (user's commit)
 
 Parallel agents, each in its own worktree branched from ca32ec64c5. Each keeps
 AGENT_STATUS.md in its worktree root:
@@ -40,6 +39,21 @@ AGENT_STATUS.md in its worktree root:
   below), non-blocking CanResumeAcquire, progress-aware RunThread, atomic Latched, waiter
   cache-line split, queued-release visibility, WaitFor(position) for macro DMA reads.
 Risky changes are meant to sit behind EDEN_NX2_* env var kill switches (see each status file).
+
+Agent state when the 5-hour usage limit hit (resets 1am America/Sao_Paulo):
+- perf/sync: FINISHED. 4 commits (8ebee87db7 deferred acquire check on the back,
+  6d0386caa4 no pending sleep while back runs, 838b27c93b lock-free waiter polling,
+  eee02ac61d WaitForEffects before macro DMA reads). Kill switches
+  EDEN_NX2_ACQUIRE_FASTPATH=0, EDEN_NX2_DMA_READ_WAITFOR=0. Builds, no new test failures.
+  Skipped the raw-read GEQ fast path and the queued-release table (P3) as unsafe; details in
+  its AGENT_STATUS.md.
+- perf/draw: stopped by the limit; see its AGENT_STATUS.md (was about to do the
+  last_descriptor_payload item).
+- perf/ring: stopped by the limit with NO commits, only an uncommitted diff (5 files); the
+  coordinator wrote its AGENT_STATUS.md from git. Review the diff before continuing.
+- port/zortos-fixes: stopped by the limit while building; see its AGENT_STATUS.md.
+To continue an agent after the reset, message it from the main session (SendMessage) so it
+resumes with its context, or start fresh from its status file.
 
 Next steps once agents finish:
 1. Read each worktree's AGENT_STATUS.md and `git log --oneline ca32ec64c5..perf/<name>`.
@@ -82,3 +96,23 @@ Key safety notes for the acquire work (from the adversarial review, verified):
 - Follow docs/policies/AI.md (Assisted-by footers, no AI Co-authored-by) and
   docs/policies/Coding.md (no [[likely]]/[[unlikely]], etc.).
 - Build with ccache; ccache max size is 100G. Baloo excludes ~/Projects.
+
+## Update: all perf branches merged locally (not pushed)
+perf/back-thread now = ca32ec64c5 profiler + 9c82b9487e write log + merges of perf/sync
+(33cbfcf584), perf/draw (a80e07ec7b; nx2_profile counters resolved: acquire 8-11, uploads
+12-15, array 16) and perf/ring (635dac27db; fixed in the merge: WaitForEffects flushes the
+pending cb run first and counts Run entries as effects, otherwise a macro DMA read could miss
+buffered constant buffer writes). Builds; tests 66/74 pass (memory_tracker x8 known).
+Kill switches: EDEN_NX2_ACQUIRE_FASTPATH, EDEN_NX2_DMA_READ_WAITFOR, EDEN_NX2_DRAW_CACHE,
+EDEN_NX2_SPLIT_BATCH, EDEN_NX2_SPLIT_CB_RUN (=0 disables). EDEN_NX2_SPLIT_VERIFY=1 checks the
+front's register mirrors. Next: benchmark in game, then push/PR (ask the user).
+port/zortos-fixes finished separately (e4b3a460f8 tests fix, 1b293b5050 Mario Tennis Fever;
+bumps shader cache versions) - keep as its own PR.
+
+## Update: Mario Kart World / PR #5 upstream import (merged into nx2)
+- Curated branch `pick/upstream-mkw` (58 commits, ending at 2580f62ecf: vi2 pacing sleeps in guest kernel)
+  pushed to origin/pick/upstream-mkw.
+- Opened PR #6 on zoeleu/Eglantine and merged it into nx2 (merge commit 336a9337c4).
+- PR #5 (Djihads80:nx2-experimental) closed on zoeleu/Eglantine as superseded by PR #6.
+- Local nx2 fast-forwarded to origin/nx2 (336a9337c4).
+

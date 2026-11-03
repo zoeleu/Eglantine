@@ -40,7 +40,7 @@ Submit a pull request to [Djihads80/Eglantine](https://github.com/Djihads80/Egla
 5. Commit your changes and push your branch to your fork.
 6. Open a pull request from your branch to `Djihads80/Eglantine`, selecting `nx2` as the base branch. Explain the problem, the change, and how you verified it, and link any related issue.
 
-Before opening a pull request, make sure your branch is up-to-date with Eglantine's `nx2` branch. Follow the [AI policy](docs/policies/AI.md), including its requirements for human-written commit messages and pull request descriptions, disclosure, review, testing, and sign-off.
+Before opening a pull request, make sure your branch is up-to-date with Eglantine's `nx2` branch.
 
 ## Non-code Contributions
 
