@@ -126,13 +126,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         // Scratch values and emulated uniform state occupy reserved high GPRs.
         // Reject native accesses that could alias that state.
         for (u32 bit : {16U, 24U, 32U, 64U}) {
-            if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66) continue;
+            if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0xf60) continue;
             const u32 reg = insn.Bits(bit, 8);
             if (reg >= (uses_uniform_bank ? high_uniform_base : 246U) && reg < 255) return fail(index, "native program uses lowering scratch registers");
         }
         // TLD/TLD4 .F16 (bit 79): the components come packed in pairs, (0, 1) in Rd and (2, 3) in
         // the second destination. Lowered as the F32 form into R248/R249 and R246/R247, then packed.
-        if ((opcode == 0xb66 || opcode == 0xb63) && insn.Bits(79, 2) == 1) {
+        if ((opcode == 0xb66 || opcode == 0xb63) && insn.Bits(79, 2) == 1 &&
+            !(opcode == 0xb66 && (insn.words[2] & ~0xffU) == 0x059e8700U)) {
             f16_dest = insn.Bits(16, 8);
             f16_second = insn.Bits(64, 8);
             f16_components = static_cast<u32>(std::popcount(insn.Bits(72, 4)));
@@ -219,6 +220,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                 return false;
             result.required_texture_buffer = binding;
+            return true;
+        };
+        // Bound surface instructions share one descriptor constant buffer, apart from the textures'.
+        const auto bind_surface_buffer = [&](u32 binding) {
+            if (result.required_surface_buffer != ~0U && result.required_surface_buffer != binding)
+                return false;
+            result.required_surface_buffer = binding;
             return true;
         };
         // P(guard slot) while a uniform guard is swapped in; P6 for lowerings that use it as
@@ -367,12 +375,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
         };
         // The carry of a 64-bit add as a value: 1 when the predicate (or its negate) holds.
-        // Unsigned x < y into predicate pd: the carry out of x + y
-        [[maybe_unused]] const auto unsigned_less = [&](u32 pd, u32 x, u32 y) {
-            emit(0x5b60000000000000ULL | predicate | 7 | (u64{pd} << 3) | (u64{x} << 8) |
-                 (u64{y} << 20) | (u64{7} << 39) | (u64{1} << 49));
-        };
-        [[maybe_unused]] const auto carry_value = [&](u32 pred, u32 negate) {
+        const auto carry_value = [&](u32 pred, u32 negate) {
             mov_imm(253, 1);
             emit(0x5ca0000000000000ULL | predicate | 253 | (u64{253} << 8) | (u64{255} << 20) |
                  (u64{pred} << 39) | (u64{negate} << 42));
@@ -555,12 +558,22 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 break;
             }
             if (insn.Bits(24, 8) == 255 && insn.words[1] == 255 && (insn.words[2] & ~0x07800affU) == 0x000e0400 &&
-                (!rewritten_uniform || insn.Bits(87, 3) == 7)) {
+                insn.Bits(64, 8) < 250) {
                 // IMAD.X RZ, RZ, c, Pn: the high word of a 64-bit add (bit 75 inverts c).
+                // UIMAD.X carries in UPn, swapped in from R239 bit 6-n as IADD3.X does.
+                const u32 carry_in = insn.Bits(87, 3);
+                const bool uniform_carry = rewritten_uniform && carry_in != 7;
+                if (uniform_carry && carry_in > 1) return fail(index, "native integer carry mode");
+                const u32 source = uniform_carry ? 6 - carry_in : carry_in, mask = 1U << source;
                 u32 c = insn.Bits(64, 8);
                 mov_imm(250, 1);
+                if (uniform_carry) {
+                    emit(0x38e8000000070000ULL | 253 | (u64{255} << 8) | (u64{mask} << 20));
+                    emit(0x38f0000000070000ULL | (u64{239} << 8) | (u64{mask} << 20));
+                }
                 emit(0x5ca0000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{255} << 20) |
-                     (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
+                     (u64{source} << 39) | (u64{insn.Bits(90, 1)} << 42));
+                if (uniform_carry) emit(0x38f0000000070000ULL | (u64{253} << 8) | (u64{mask} << 20));
                 if (insn.Bits(75, 1)) {
                     emit(0x0400000000000000ULL | predicate | 251 | (u64{c} << 8) | (u64{0xffffffffU} << 20) | (u64{2} << 53));
                     c = 251;
@@ -755,19 +768,24 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x824: { // Captured low-word IMAD forms; bit 75 negates the addend.
             const bool negate_c = insn.Bits(75, 1) != 0;
-            if (insn.words[1] == 1 && (insn.words[2] & ~(0x07800800U | 0xffU)) == 0x000e0600U) {
-                // IMAD.X Rd, Ra, 1, Rc, Pn: Ra + Rc plus the carry predicate in bits 87-90 (~Rc with bit 75).
+            if (insn.Bits(74, 1)) { // IMAD.X with an immediate: a * imm + c + carry
+                if ((insn.words[2] & ~0x07800effU) != 0x000e0000 ||
+                    (negate_c && insn.words[1] != 1))
+                    return fail(index, "native extended immediate multiply mode");
+                const u32 a = insn.Bits(24, 8);
                 u32 c = insn.Bits(64, 8);
-                mov_imm(252, 1);
-                emit(0x5ca0000000000000ULL | predicate | 252 | (u64{252} << 8) | (u64{255} << 20) |
-                     (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
-                if (negate_c) {
-                    emit(0x0400000000000000ULL | predicate | 251 | (u64{c} << 8) | (u64{0xffffffffU} << 20) | (u64{2} << 53));
+                if (negate_c) { // ~c here: the high word of a 64-bit subtraction
+                    mov_imm(251, ~0U);
+                    emit(0x5c40000000000000ULL | predicate | 251 | (u64{251} << 8) | (u64{c} << 20) |
+                         (u64{2} << 41) | (u64{7} << 48));
                     c = 251;
                 }
-                emit(0x5c10000000000000ULL | predicate | 250 | (u64{insn.Bits(24, 8)} << 8) |
-                     (u64{c} << 20));
-                emit(base(0x5c10000000000000ULL) | (u64{250} << 8) | (u64{252} << 20));
+                carry_value(insn.Bits(87, 3), insn.Bits(90, 1));
+                if (insn.words[1] == 1)
+                    emit(base(0x5c10000000000000ULL) | (u64{a} << 8) | (u64{c} << 20));
+                else
+                    multiply_low(a, insn.words[1], c, true);
+                emit(base(0x5c10000000000000ULL) | (u64{dest} << 8) | (u64{253} << 20));
                 break;
             }
             if (insn.words[1] == 1 && (insn.words[2] & 0xfffff700U) == 0x078e0200) {
@@ -811,13 +829,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x886: { // VOTEU ballot and independent uniform predicate output.
             const u32 output = insn.Bits(81, 3), target = insn.Bits(16, 8);
-            if ((target >= 16 && target != 63) || insn.words[1] ||
-                insn.Bits(72, 2) > 2 || native_predicate != 7)
+            const u32 mapped_target = uniform_register(target);
+            if (mapped_target == ~0U || insn.Bits(24, 8) || insn.words[1] ||
+                (insn.words[2] & ~0x078e0300U) || insn.Bits(72, 2) > 2 || native_predicate != 7)
                 return fail(index, "native uniform vote mode");
             const u32 temporary = output == 7 ? 7 : 6 - output;
             const u32 mask = 1U << temporary;
             if (output != 7) emit(0x38e8000000070000ULL | 253 | (u64{255} << 8) | (u64{mask} << 20));
-            emit(0x50d8000000070000ULL | uniform_register(target) |
+            emit(0x50d8000000070000ULL | mapped_target |
                 (u64{insn.Bits(87, 4)} << 39) | (u64{temporary} << 45) | (u64{insn.Bits(72, 2)} << 48));
             if (output != 7) {
                 emit(0x38e8000000070000ULL | 239 | (u64{239} << 8) | (u64{mask} << 20));
@@ -965,15 +984,17 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{high_result ? high_reg : low_reg} << 8) | (u64{insn.words[1]} << 20));
             break;
         }
-        case 0xb82: { // LDC.64 indexed byte offset; bits 78-79 the mode as Maxwell's (2 = IS)
+        case 0xb82: { // LDC indexed byte offset; bits 78-79 the mode as Maxwell's (2 = IS)
             // .IS: Ra + offset addresses all constant buffers as one space, the buffer in its high
             // half (Kirby Air Riders' vertex shaders), which Eden's Maxwell LDC implements.
-            const u32 width = insn.Bits(73, 3), mode = insn.Bits(78, 2);
-            if ((width != 4 && width != 5) || (mode != 0 && mode != 2) || insn.Bits(91, 1) ||
-                bank() >= 18 ||
+            const u32 width = insn.Bits(73, 3);
+            const u32 mode = insn.Bits(78, 2);
+            if (width > 5 || (mode != 0 && mode != 2) || (insn.words[2] & ~0xce00U) ||
+                (insn.words[1] & 0xf800003fU) || bank() >= 18 ||
                 (width == 5 && ((dest & 1) || dest >= 254))) return fail(index, "native indexed constant load mode");
             emit(base(0xef90000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
-                 (u64{insn.Bits(38, 16)} << 20) | (u64{bank()} << 36) | (u64{mode} << 44) | (u64{width} << 48));
+                 (u64{insn.Bits(38, 16)} << 20) | (u64{bank()} << 36) |
+                 (u64{mode} << 44) | (u64{width} << 48));
             break;
         }
         case 0xf89: { // SHFL with immediate lane and segmentation/clamp mask, any mode.
@@ -1060,10 +1081,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                      (u64{1} << 48));
                 break;
             }
-            if ((insn.words[2] & ~0x03800000U) != 0x0010e100 || insn.Bits(40, 24) || (insn.Bits(24, 8) & 1))
+            // Register address with a signed offset, any type (bits 73-75) and op (87-90); bit 72 = 64-bit address.
+            const s32 offset = static_cast<s32>(insn.Bits(40, 24) << 8) >> 8;
+            const u32 type = insn.Bits(73, 3), operation = insn.Bits(87, 4), address = insn.Bits(24, 8);
+            if (insn.Bits(91, 1) || type > 5 || operation > 7 || offset < -0x80000 || offset > 0x7ffff ||
+                insn.Bits(32, 8) >= 250 || (address != 255 && (address >= 249 || (insn.Bits(72, 1) && (address & 1)))))
                 return fail(index, "native global reduction mode");
-            emit(0xebf8000000000000ULL | predicate | insn.Bits(32, 8) |
-                (u64{insn.Bits(24, 8)} << 8) | (u64{insn.Bits(87, 3)} << 23) | (u64{1} << 48));
+            emit(0xebf8000000000000ULL | predicate | insn.Bits(32, 8) | (u64{address} << 8) |
+                 (u64{type} << 20) | (u64{operation} << 23) |
+                 (u64{static_cast<u32>(offset) & 0xfffff} << 28) | (u64{insn.Bits(72, 1)} << 48));
             break;
         }
         case 0x2bd: // UFLO.U32, the highest set-bit index (.SH, bit 74: its shift amount).
@@ -1209,23 +1235,22 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || dest == 255 ||
                 coordinate > (dimension >= 4 ? 252U : 253U))
                 return fail(index, "native formatted surface load mode");
-            if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
+            if (!bind_surface_buffer(binding))
                 return fail(index, "native surface descriptor buffer conflict");
-            result.required_texture_buffer = binding;
             emit(base(0xeb00000000000000ULL) | (u64{coordinate} << 8) |
                 (u64{channels} << 20) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
             break;
         }
-        case 0xb9b: { // SUST.P.2D/3D.IGN, direct descriptor and all four channels.
+        case 0xb9b: { // SUST.P.1D_BUFFER/2D/3D.IGN, direct descriptor and all four channels.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
             const u32 dimension = insn.Bits(61, 3);
             const bool strong = insn.words[2] == 0x0010af00; // .STRONG.GPU: fenced on both sides
-            if ((insn.words[2] != 0x00100f00 && !strong) || dimension < 3 || dimension > 5 ||
+            if ((insn.words[2] != 0x00100f00 && !strong) || (dimension != 1 && (dimension < 3 || dimension > 5)) ||
                 binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || data > 252 || coordinate > (dimension >= 4 ? 252U : 253U))
                 return fail(index, "native formatted surface store mode");
             // A second descriptor buffer: SUST.B with the handle, loaded from that buffer, in R250.
-            const bool bindless = !bind_texture_buffer(binding);
+            const bool bindless = !bind_surface_buffer(binding);
             if (bindless) {
                 emit(0x4c98000000070000ULL | 250 | (u64{15} << 39) | (u64{offset} << 20) | (u64{binding} << 34));
             }
@@ -1242,9 +1267,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (insn.words[2] != 0x0010e000 || insn.Bits(61, 3) != 3 || binding >= 18 ||
                 offset > 0x1fff || insn.Bits(59, 2) || coordinate > 253)
                 return fail(index, "native surface reduction mode");
-            if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
+            if (!bind_surface_buffer(binding))
                 return fail(index, "native surface descriptor buffer conflict");
-            result.required_texture_buffer = binding;
             // Maxwell SURED (as the frontend decodes it): operand 0-7, coordinates 8-15, ADD and
             // U32 are zero at 24 and 20, type 33 (3 = 2D), bound offset 36, bound 51.
             emit(0xeb40000000000000ULL | predicate | data | (u64{coordinate} << 8) |
@@ -1514,19 +1538,24 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             emit(0xf0c8000000000000ULL | predicate | target | (u64{special} << 20));
             break;
         }
-        case 0x28c: case 0x88c: { // UISETP, signed (bit 73) or unsigned, with UPT accumulation.
+        case 0x28c: case 0x88c: { // UISETP, signed (bit 73) or unsigned, combined (bits 74-75) with UPn.
             const u32 output = insn.Bits(81, 3);
             const u32 a = uniform_register(insn.Bits(24, 8)), b = opcode == 0x88c ? 252U : uniform_register(insn.Bits(32, 8));
-            if (output > 6 || insn.Bits(84, 3) != 7 || insn.Bits(87, 4) != 7 ||
-                (insn.Bits(72, 4) & ~2U) || insn.Bits(12, 4) != 7 || a == ~0U || b == ~0U)
+            const u32 combine = insn.Bits(87, 3), combine_op = insn.Bits(74, 2);
+            if (output > 6 || insn.Bits(84, 3) != 7 || insn.Bits(72, 1) || combine_op == 3 ||
+                insn.Bits(12, 4) != 7 || a == ~0U || b == ~0U)
                 return fail(index, "native uniform comparison mode");
-            const u32 temporary = 6 - output, mask = 1U << temporary;
+            // The combined UPn is swapped in from R239 bit 6-n, as Maxwell ISETP's Pc (UPT stays PT).
+            const u32 temporary = 6 - output, combine_slot = combine == 7 ? 7U : 6 - combine;
+            const u32 combine_mask = combine == 7 ? 0U : 1U << combine_slot;
+            const u32 mask = (1U << temporary) | combine_mask;
             if (opcode == 0x88c) mov_imm(252, insn.words[1]);
             emit(0x38e8000000070000ULL | 253 | (u64{255} << 8) | (u64{mask} << 20));
+            if (combine_mask) emit(0x38f0000000070000ULL | (u64{239} << 8) | (u64{combine_mask} << 20));
             emit(0x5b60000000070000ULL | 7 | (u64{temporary} << 3) |
-                (u64{a} << 8) | (u64{b} << 20) | (u64{7} << 39) | (u64{insn.Bits(73, 1)} << 48) |
-                (u64{insn.Bits(76, 3)} << 49));
-            emit(0x38e8000000070000ULL | 239 | (u64{239} << 8) | (u64{mask} << 20));
+                (u64{a} << 8) | (u64{b} << 20) | (u64{combine_slot} << 39) | (u64{insn.Bits(90, 1)} << 42) |
+                (u64{combine_op} << 45) | (u64{insn.Bits(73, 1)} << 48) | (u64{insn.Bits(76, 3)} << 49));
+            emit(0x38e8000000070000ULL | 239 | (u64{239} << 8) | (u64{1U << temporary} << 20));
             emit(0x38f0000000070000ULL | (u64{253} << 8) | (u64{mask} << 20));
             break;
         }
@@ -1771,6 +1800,37 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             break;
         }
         case 0xb66: { // TLD.SCR, direct texel fetch at level zero (.LZ) or a given level (.LL)
+            if ((insn.words[2] & ~0xffU) == 0x059e8700U) {
+                // TLD.LL.F16 RGB with the level in Rb: fetched as F32 RGB, then packed in pairs.
+                const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
+                const u32 a = insn.Bits(24, 8), b = insn.Bits(32, 8);
+                const u32 high = insn.Bits(64, 8), limit = uses_uniform_bank ? high_uniform_base : 246U;
+                if (insn.Bits(59, 5) != 6 || binding >= 18 || offset > 0x1fff ||
+                    a + 1 >= limit || b >= limit || (dest != 255 && dest >= limit) ||
+                    (high != 255 && high >= limit) ||
+                    (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding))
+                    return fail(index, "native half explicit texel fetch mode");
+                result.required_texture_buffer = binding;
+                for (u32 i = 0; i < 2; ++i)
+                    emit(0x5c98000000000000ULL | predicate | (250 + i) |
+                         (u64{15} << 39) | (u64{a + i} << 20));
+                emit(0x5c98000000000000ULL | predicate | 246 | (u64{15} << 39) | (u64{b} << 20));
+                emit(0xdc00000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{246} << 20) |
+                     (u64{2} << 28) | (u64{7} << 31) | (u64{offset} << 36) |
+                     (u64{1} << 49) | (u64{7} << 51) | (u64{1} << 55));
+                const auto pack = [&](u32 target, u32 low, u32 upper) {
+                    if (target == 255) return;
+                    emit(0x5ca8000000000000ULL | predicate | 246 | (u64{1} << 8) |
+                         (u64{2} << 10) | (u64{low} << 20));
+                    emit(0x5ca8000000000000ULL | predicate | 247 | (u64{1} << 8) |
+                         (u64{2} << 10) | (u64{upper} << 20));
+                    emit(0x5c18000000000000ULL | predicate | target | (u64{247} << 8) |
+                         (u64{246} << 20) | (u64{16} << 39));
+                };
+                pack(static_cast<u32>(dest), 250, 251);
+                pack(high, 252, 255);
+                break;
+            }
             const u32 mask = insn.Bits(72, 4);
             const bool level = insn.Bits(87, 3) == 3; // .LL: the level follows the coordinates
             // Bit 76: a texel offset after the coordinates and level. 2D only, as Maxwell TLDS
@@ -1810,16 +1870,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 if (level || offsets)
                     return fail(index, "native texture descriptor buffer conflict");
                 // A second descriptor buffer: TLD.B (LZ) with the coordinates in R250.. (array
-                // index or Z after Ra) and the handle, loaded from that buffer, in R253.
+                // index or Z after Ra) and the handle, loaded from that buffer, in R246.
                 const auto copy = [&](u32 target, u32 source) {
                     emit(0x5c98000000000000ULL | predicate | target | (u64{15} << 39) | (u64{source} << 20));
                 };
                 copy(250, source_a);
                 if (array || volume) copy(251, source_a + 1);
                 if (dimension != 0) copy(array || volume ? 252 : 251, source_b);
-                emit(0x4c98000000070000ULL | 253 | (u64{15} << 39) | (u64{insn.Bits(40, 14)} << 20) |
+                emit(0x4c98000000070000ULL | 246 | (u64{15} << 39) | (u64{insn.Bits(40, 14)} << 20) |
                      (u64{binding} << 34));
-                emit(0xdd00000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{253} << 20) |
+                emit(0xdd00000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{246} << 20) |
                      (u64{array ? 3U : volume ? 4U : dimension == 0 ? 0U : 2U} << 28) | (u64{mask} << 31) |
                      (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
                 const u32 components = static_cast<u32>(std::popcount(mask));
@@ -1944,20 +2004,79 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 mask = insn.Bits(72, 4), second_dest = insn.Bits(64, 8);
             const u32 source_a = insn.Bits(24, 8), source_b = insn.Bits(32, 8);
             const u32 binding = insn.Bits(54, 5);
-            // Bit 76: a texel offset after the coordinates (x, y in Ra, Ra+1, offsets in Rb, as
-            // for TEX); Maxwell TLD4 takes it as AOFFI (bits 54-55) from Rb.
-            const bool offsets = insn.Bits(76, 1) != 0;
-            if (insn.Bits(61, 3) != 1 || insn.Bits(77, 4) || insn.Bits(81, 3) != 7 || insn.Bits(59, 1) ||
+            // Bits 76-77, as Maxwell TLD4's 54-55: 1 is a texel offset after the coordinates (x, y in
+            // Ra, Ra+1, offsets in Rb, as for TEX), 2 per-tap offsets (PTP), proven constant.
+            const u32 offset_mode = insn.Bits(76, 2);
+            const bool offsets = offset_mode == 1, per_tap = offset_mode == 2;
+            const u32 register_limit = uses_uniform_bank ? high_uniform_base : 246U;
+            if (insn.Bits(61, 3) != 1 || offset_mode == 3 || insn.Bits(78, 3) || insn.Bits(81, 3) != 7 ||
+                insn.Bits(59, 1) || (per_tap && (bindless || f16_components != 0)) || (!bindless && insn.Bits(91, 1)) ||
                 (offsets && (bindless || source_b == 255 || (source_a != 255 && source_a >= 245))) ||
                 insn.Bits(89, 1) || mask == 0 ||
                 (bindless ? (handle >= 246 || insn.Bits(46, 13) || !insn.Bits(91, 1))
                           : (insn.Bits(40, 14) > 0x1fff || binding >= 18 ||
                              (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding))))
                 return fail(index, "native texture gather mode");
+            if (per_tap) {
+                if (!insn.Bits(60, 1) || mask != 15 || source_a + 1 >= register_limit ||
+                    source_b + 1 >= register_limit || (dest != 255 && dest + 1 >= register_limit) ||
+                    (second_dest != 255 && second_dest + 1 >= register_limit))
+                    return fail(index, "native per-tap gather operands");
+                bool terminal = false;
+                for (const auto& instruction : code) {
+                    if (instruction.Bits(12, 4) == 15) continue;
+                    const u32 op = instruction.Bits(0, 12);
+                    if (op == 0x94d && instruction.Bits(12, 4) == 7) {
+                        terminal = true;
+                        break;
+                    }
+                    if (op != 0x326 && op != 0x802 && op != 0x307 && op != 0x421 &&
+                        op != 0xa20 && op != 0xb63 && op != 0x221 && op != 0x823 &&
+                        op != 0x423 && op != 0x223 && op != 0x308 && op != 0x220 && op != 0x820)
+                        return fail(index, "native per-tap gather control-flow proof");
+                }
+                if (!terminal) return fail(index, "native per-tap gather terminal proof");
+                std::array<std::optional<u32>, 2> tap_offsets;
+                for (u32 cursor = index; cursor > 0 && (!tap_offsets[0] || !tap_offsets[1]);) {
+                    const auto& definition = code[--cursor];
+                    const u32 op = definition.Bits(0, 12), target = definition.Bits(16, 8);
+                    if (op == 0xb63) {
+                        const u32 count = std::popcount(definition.Bits(72, 4));
+                        const u32 high = definition.Bits(64, 8);
+                        for (u32 i = 0; i < 2; ++i) {
+                            if (tap_offsets[i]) continue;
+                            const u32 reg = source_b + i;
+                            if ((target != 255 && reg >= target && reg < target + (high == 255 ? count : std::min(count, 2U))) ||
+                                (high != 255 && count > 2 && reg >= high && reg < high + count - 2))
+                                return fail(index, "native per-tap gather offset clobber");
+                        }
+                        continue;
+                    }
+                    if (op != 0x802 && op != 0x307 && op != 0x421 && op != 0xa20)
+                        return fail(index, "native per-tap gather offset proof");
+                    for (u32 i = 0; i < 2; ++i) {
+                        if (tap_offsets[i] || target != source_b + i) continue;
+                        if (op != 0x802 || definition.Bits(12, 4) != 7 || definition.Bits(24, 8) ||
+                            definition.words[2] != 0x00000f00)
+                            return fail(index, "native per-tap gather nonconstant tap_offsets");
+                        tap_offsets[i] = definition.words[1];
+                    }
+                }
+                for (const auto& packed : tap_offsets) {
+                    if (!packed) return fail(index, "native per-tap gather missing tap_offsets");
+                    for (u32 shift = 0; shift < 32; shift += 8) {
+                        const u32 value = (*packed >> shift) & 255;
+                        if (value > 31 && value < 224)
+                            return fail(index, "native per-tap gather offset range");
+                    }
+                }
+                for (u32 i = 0; i < tap_offsets.size(); ++i)
+                    emit(0x010000000007f000ULL | (248 + i) | (u64{*tap_offsets[i]} << 20));
+            }
             if (!bindless) result.required_texture_buffer = binding;
             // Two coordinates: x in Ra, y in Rb (the coordinate list splits evenly across them);
-            // with an offset, x and y in Ra, Ra+1 and the offset in Rb.
-            const u32 y = !offsets ? source_b : source_a == 255 ? 255U : source_a + 1;
+            // with offsets, x and y in Ra, Ra+1 and the offsets in Rb.
+            const u32 y = !offsets && !per_tap ? source_b : source_a == 255 ? 255U : source_a + 1;
             emit(0x5c98000000000000ULL | predicate | 250 | (u64{15} << 39) | (u64{source_a} << 20));
             emit(0x5c98000000000000ULL | predicate | 251 | (u64{15} << 39) | (u64{y} << 20));
             if (offsets) {
@@ -1970,9 +2089,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                      (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
             } else {
             emit(0xc800000000000000ULL | predicate | 250 | (u64{250} << 8) |
-                 (u64{offsets ? 246U : 255U} << 20) | (u64{2} << 28) | (u64{mask} << 31) |
+                 (u64{offsets ? 246U : per_tap ? 248U : 255U} << 20) | (u64{2} << 28) | (u64{mask} << 31) |
                  (u64{insn.Bits(40, 14)} << 36) | (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51) |
-                 (u64{offsets ? 1U : 0U} << 54) | (u64{insn.Bits(87, 2)} << 56));
+                 (u64{offset_mode} << 54) | (u64{insn.Bits(87, 2)} << 56));
             }
             const u32 components = static_cast<u32>(std::popcount(mask));
             const bool split = second_dest != 255;
@@ -1985,14 +2104,99 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             break;
         }
-        case 0xb60: case 0xf60: case 0x361: { // TEX; 0xf60: handle in a uniform register; 0x361: TEX.B
-            // Bindless forms become Maxwell TEX.B, the handle first among the meta registers (the
-            // texture pass tracks it back to its constant buffer words). 0x361 lists the handle
-            // right after the coordinates, then the LOD and the offsets (see general_tex).
-            const bool bindless = opcode != 0xb60;
-            const u32 handle = opcode == 0xf60 ? uniform_register(insn.Bits(40, 6)) : 255;
-            if (bindless && ((opcode == 0xf60 && (handle == ~0U || handle >= 246 || insn.Bits(46, 13))) ||
-                             (opcode == 0x361 && (insn.Bits(40, 19) || insn.Bits(87, 3) > 3))))
+        case 0xf60: { // TEX with the handle in a uniform register: Maxwell TEX.B, once the pair's
+                      // second register is shown to be the sampler half of the first.
+            const u32 handle = insn.Bits(40, 6);
+            const u32 source_a = insn.Bits(24, 8), source_b = insn.Bits(32, 8);
+            const u32 second_dest = insn.Bits(64, 8);
+            const u32 mask = insn.Bits(72, 4);
+            const auto supported_texture = [](const Instruction& texture) {
+                const u32 h = texture.Bits(40, 6), m = texture.Bits(72, 4);
+                // LOD modes 0-3 (auto, LZ, LB, LL); packed 2D, so LB/LL read the value from Rb.
+                return texture.Bits(0, 12) == 0xf60 && h < 16 && !(h & 1) &&
+                       (texture.words[1] & ~0x3fffU) == 0x30000000U &&
+                       (texture.words[2] & ~0x07800fffU) == 0x081e0000U &&
+                       texture.Bits(87, 3) <= 3 && !texture.Bits(96, 9) && m != 0;
+            };
+            const auto handle_extract = [](const Instruction& shift, u32 packed) {
+                return packed < 16 && !(packed & 1) &&
+                       (shift.words[0] & ~0x00ff0000U) == 0x3f007899U &&
+                       shift.Bits(16, 8) == packed + 1 && shift.words[1] == 20 &&
+                       shift.words[2] == (0x08011600U | packed) && !shift.Bits(96, 9);
+            };
+            if (index == 0 || !supported_texture(insn))
+                return fail(index, "native uniform bindless texture mode");
+            u32 shift_index = index;
+            const u32 begin = index > 32 ? index - 32 : 0;
+            while (shift_index > begin) {
+                const auto& prior = code[--shift_index];
+                const u32 op = prior.Bits(0, 12);
+                if (handle_extract(prior, handle)) break;
+                if (op == 0x308 || op == 0x220 || op == 0xa20 || op == 0xa23 ||
+                    op == 0x621 || op == 0x223 || op == 0x221 || supported_texture(prior))
+                    continue;
+                const u32 other = prior.Bits(64, 8);
+                if (other != handle && handle_extract(prior, other)) continue;
+                break;
+            }
+            if (!handle_extract(code[shift_index], handle) ||
+                std::any_of(code.begin(), code.end(), [&](const Instruction& instruction) {
+                    const u32 op = instruction.Bits(0, 12);
+                    // WARPSYNC (0x948) never transfers control, so it cannot enter the window.
+                    if (op < 0x940 || op > 0x95f || op == 0x94d || op == 0x95b || op == 0x948) return false;
+                    if (op != 0x947 || (instruction.words[0] & ~0xf000U) != 0x947 ||
+                        (instruction.words[2] & ~0x0783ffffU) || instruction.Bits(96, 9))
+                        return true;
+                    const u32 branch = static_cast<u32>(&instruction - code.data());
+                    const u64 raw = instruction.words[1] | (u64{instruction.words[2] & 0x3ffff} << 32);
+                    const s64 relative = static_cast<s64>(raw << 14) >> 14;
+                    const s64 target = s64{branch} * 16 + 16 + relative;
+                    return target <= s64{branch} * 16 || target % 16 ||
+                           target >= static_cast<s64>(code.size()) * 16 ||
+                           (target > s64{shift_index} * 16 && target <= s64{index} * 16);
+                }))
+                return fail(index, "native uniform bindless texture handle provenance");
+            const u32 components = static_cast<u32>(std::popcount(mask));
+            const auto valid_span = [](u32 reg, u32 count) {
+                return reg == 255 || (count != 0 && reg + count <= 216 &&
+                                      (count == 1 || !(reg & 1)));
+            };
+            if (!valid_span(static_cast<u32>(dest), std::min(components, 2U)) ||
+                !valid_span(second_dest, components > 2 ? components - 2 : 0) ||
+                (dest != 255 && dest == second_dest))
+                return fail(index, "native uniform bindless texture destination pair");
+            const auto copy = [&](u32 target, u32 source) {
+                emit(0x5c98000000000000ULL | predicate | target | (u64{15} << 39) |
+                     (u64{source} << 20));
+            };
+            // Three packed operands (x, y, lod/bias) split 2+1: coordinates in Ra pair, value in Rb.
+            // Maxwell TEX.B wants the handle in Rb and the LOD right after it, hence R246/R247.
+            const u32 lod = insn.Bits(87, 3);
+            const bool has_lod = lod >= 2;
+            if (has_lod && source_a != 255 && ((source_a & 1) || source_a + 2 > 216))
+                return fail(index, "native uniform bindless texture lod operands");
+            copy(250, source_a);
+            copy(251, has_lod ? (source_a == 255 ? 255U : source_a + 1) : source_b);
+            if (has_lod) {
+                copy(246, uniform_register(handle));
+                copy(247, source_b);
+            }
+            emit(0xde80000000000000ULL | predicate | 250 | (u64{250} << 8) |
+                 (u64{has_lod ? 246U : uniform_register(handle)} << 20) | (u64{2} << 28) |
+                 (u64{mask} << 31) | (u64{lod} << 37) |
+                 (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
+            for (u32 i = 0; i < components; ++i) {
+                const u32 target = i < 2 ? static_cast<u32>(dest) : second_dest;
+                if (target != 255) copy(target + i % 2, 250 + i);
+            }
+            break;
+        }
+        case 0xb60: case 0x361: { // TEX; 0x361: TEX.B
+            // TEX.B becomes Maxwell TEX.B, the handle first among the meta registers (the texture
+            // pass tracks it back to its constant buffer words). 0x361 lists the handle right after
+            // the coordinates, then the LOD and the offsets (see general_tex).
+            const bool bindless = opcode == 0x361;
+            if (bindless && (insn.Bits(40, 19) || insn.Bits(87, 3) > 3))
                 return fail(index, "native bindless texture mode");
             const u32 mask = insn.Bits(72, 4);
             const u32 second_dest = insn.Bits(64, 8);
@@ -2003,7 +2207,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool depth_compare = insn.Bits(78, 1);
             const u32 dimension = insn.Bits(61, 3), lod = insn.Bits(87, 3);
             const u32 source_a = insn.Bits(24, 8), source_b = insn.Bits(32, 8);
-            if (!bindless && dimension == 5 && depth_compare && lod == 0 && !split && mask == 1) {
+            if (!bindless && dimension == 5 && depth_compare && lod == 0 && !split && mask == 1 &&
+                insn.Bits(54, 5) == 2 &&
+                (result.required_texture_buffer == ~0U || result.required_texture_buffer == 2)) {
                 if (!insn.Bits(60, 1) || insn.Bits(76, 2) || insn.Bits(81, 3) != 7 ||
                     insn.Bits(59, 1) || insn.Bits(40, 14) > 0x1fff || insn.Bits(54, 5) != 2 ||
                     (source_a & 1) || (source_b & 1) || source_a >= 248 || source_b >= 248 || dest >= 248)
@@ -2029,8 +2235,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 constexpr std::array<u32, 8> maxwell_type{0, 2, 4, 6, 1, 3, 0, 7};
                 const bool offsets = insn.Bits(76, 1) != 0;
                 // Bit 59 is .B, set in 0x361's encoding.
-                if (dimension == 6 || insn.Bits(77, 1) || insn.Bits(81, 3) != 7 ||
-                    insn.Bits(59, 1) != (opcode == 0x361 ? 1U : 0U) ||
+                if (dimension == 6 || insn.Bits(77, 1) || insn.Bits(80, 1) || insn.Bits(91, 1) ||
+                    insn.Bits(81, 3) != 7 || insn.Bits(59, 1) != (opcode == 0x361 ? 1U : 0U) ||
                     (!bindless && (insn.Bits(40, 14) > 0x1fff || insn.Bits(54, 5) >= 18)) ||
                     (lod > 3 && lod != 6 && lod != 7) || (depth_compare && mask != 1) || mask == 0)
                     return false;
@@ -2049,10 +2255,17 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     if (i < in_a) return source_a == 255 ? 255U : source_a + i;
                     return source_b == 255 ? 255U : source_b + (i - in_a);
                 };
-                if ((source_a != 255 && source_a + in_a > 246) ||
-                    (count > in_a && source_b != 255 && source_b + (count - in_a) > 246))
+                const u32 limit = uses_uniform_bank ? high_uniform_base : 246U;
+                const u32 components = static_cast<u32>(std::popcount(mask));
+                const u32 low_count = insn.Bits(79, 1) ? (split ? 1U : (components + 1) / 2) :
+                                      split ? std::min(components, 2U) : components;
+                const u32 high_count = insn.Bits(79, 1) ? 1U : components > 2 ? components - 2 : 0;
+                if ((source_a != 255 && source_a + in_a > limit) ||
+                    (count > in_a && source_b != 255 && source_b + (count - in_a) > limit) ||
+                    (dest != 255 && dest + low_count > limit) ||
+                    (split && second_dest + high_count > limit))
                     return false;
-                const u32 texture_handle = opcode == 0x361 ? value(coordinates) : handle;
+                const u32 texture_handle = bindless ? value(coordinates) : 255U;
                 if (bindless && texture_handle >= 246) return false;
                 // A second descriptor buffer is read bindless: TEX.B takes the handle, loaded from
                 // that buffer, as its first meta register.
@@ -2086,7 +2299,6 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                      (u64{insn.Bits(90, 1)} << 49) | (u64{depth_compare} << 50) | (u64{7} << 51) |
                      (u64{offsets} << 54) | (u64{lod} << 55));
                 }
-                const u32 components = static_cast<u32>(std::popcount(mask));
                 if (insn.Bits(79, 1)) {
                     // FP16 results: (c0, c1) packed into the first destination, (c2, c3) into
                     // the second (F2F writes the half in the low 16 bits; ISCADD merges).
@@ -2094,7 +2306,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                         if (target == 255) return;
                         emit(0x5ca8000000000000ULL | predicate | 246 | (u64{1} << 8) | (u64{2} << 10) | (u64{low} << 20));
                         emit(0x5ca8000000000000ULL | predicate | 247 | (u64{1} << 8) | (u64{2} << 10) | (u64{high} << 20));
-                        emit(0x5c18000000000000ULL | predicate | target | (u64{246} << 8) | (u64{247} << 20) | (u64{16} << 39));
+                        emit(0x5c18000000000000ULL | predicate | target | (u64{247} << 8) | (u64{246} << 20) | (u64{16} << 39));
                     };
                     pack(static_cast<u32>(dest), 250, components > 1 ? 251U : 255U);
                     if (components > 2) {
@@ -2485,7 +2697,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                       // combine 69-70, H_AND 71, compare 76-79, FTZ 80, P/Q 81-86, input 87-90.
             u64 source = u64{250} << 20;
             if (opcode == 0x234) {
-                if ((insn.words[1] & 0x0fffff00U) || insn.Bits(64, 5))
+                if (dest || (insn.words[1] & 0x0fffff00U) || (insn.words[2] & ~0x07ffffe0U) ||
+                    insn.Bits(69, 2) == 3)
                     return fail(index, "native half comparison mode");
                 source = (u64{insn.Bits(32, 8)} << 20) | (u64{insn.Bits(60, 2)} << 28) |
                          (u64{insn.Bits(62, 1)} << 30) | (u64{insn.Bits(63, 1)} << 31);
@@ -2582,19 +2795,24 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x217: case 0x817: case 0xa17: case 0xc17: { // IMNMX register, immediate, cbuf or uniform operand.
             if ((insn.words[2] & ~(0x04000200U | (opcode == 0xc17 ? 0x08000000U : 0U))) != 0x03800000 ||
-                (opcode == 0x817 && insn.words[1] > 0x7ffffU && insn.words[1] < 0xfff80000U) ||
                 (opcode != 0xa17 && opcode != 0x817 && insn.words[1] > 255U) ||
                 (opcode == 0xa17 && (!valid_cbuf() || insn.Bits(62, 2))))
                 return fail(index, "native integer min/max mode");
-            // An immediate is a signed 20-bit value: 19 bits at 20, the sign in bit 56.
+            // An immediate is a signed 20-bit value: 19 bits at 20, the sign in bit 56. A wider
+            // one goes through a register.
+            const bool wide_immediate =
+                opcode == 0x817 && insn.words[1] > 0x7ffffU && insn.words[1] < 0xfff80000U;
+            const bool immediate = opcode == 0x817 && !wide_immediate;
             const u32 source = opcode == 0xc17   ? uniform_register(insn.words[1])
                                : opcode == 0xa17 ? operand(1, false)
-                               : opcode == 0x817 ? insn.words[1] & 0x7ffffU
+                               : wide_immediate  ? 250U
+                               : immediate       ? insn.words[1] & 0x7ffffU
                                                  : insn.words[1];
             if (source == ~0U) return fail(index, "native uniform min/max operand");
-            emit(base(opcode == 0x817 ? 0x3820000000000000ULL : 0x5c20000000000000ULL) |
+            if (wide_immediate) mov_imm(250, insn.words[1]);
+            emit(base(immediate ? 0x3820000000000000ULL : 0x5c20000000000000ULL) |
                  (u64{insn.Bits(24, 8)} << 8) | (u64{source} << 20) |
-                 (u64{opcode == 0x817 ? insn.words[1] >> 31 : 0U} << 56) |
+                 (u64{immediate ? insn.words[1] >> 31 : 0U} << 56) |
                  (u64{insn.Bits(87, 4)} << 39) | (u64{insn.Bits(73, 1)} << 48));
             break;
         }
@@ -2624,21 +2842,36 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             break;
         }
         case 0xa11: { // LEA with constant base and carry predicate.
-            if ((insn.words[2] & ~(0x07800000U | 0x0000f800U)) == 0x000f06ffU && !insn.Bits(62, 2) &&
-                insn.Bits(75, 5) != 0) {
-                // LEA.HI.X.SX32, no high source: (sign-extended Ra << shift) >> 32, plus the
-                // constant high word and the carry predicate (bits 87-90).
+            if (insn.Bits(80, 1) && insn.Bits(81, 3) == 7 && insn.Bits(64, 8) == 255 && insn.Bits(75, 5) &&
+                !insn.Bits(72, 1) && !insn.Bits(62, 2)) {
+                // LEA.HI Rd, Ra, c[b][o], RZ, s: c[b][o] + (Ra >> (32 - s)), as 0x211's high form;
+                // LEA.HI.X (bit 74) adds a carry predicate (bits 87-89, negate 90).
                 const u32 b = operand(1, false);
                 emit(0x3828000000000000ULL | predicate | 250 | (u64{insn.Bits(24, 8)} << 8) |
-                     (u64{32 - insn.Bits(75, 5)} << 20) | (u64{1} << 48));
-                mov_imm(252, 1);
-                emit(0x5ca0000000000000ULL | predicate | 252 | (u64{252} << 8) | (u64{255} << 20) |
-                     (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
+                     (u64{32 - insn.Bits(75, 5)} << 20) | (u64{insn.Bits(73, 1)} << 48));
                 emit(0x5c10000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{b} << 20));
-                emit(base(0x5c10000000000000ULL) | (u64{250} << 8) | (u64{252} << 20));
+                if (insn.Bits(74, 1)) {
+                    const u32 condition = insn.Bits(87, 3), negate = insn.Bits(90, 1);
+                    if (condition != 7 || !negate) {
+                        mov_imm(252, 1);
+                        emit(0x5c10000000000000ULL | (u64{(negate << 3) | condition} << 16) | 250 |
+                             (u64{250} << 8) | (u64{252} << 20));
+                    }
+                }
+                emit(base(0x5c10000000000000ULL) | (u64{250} << 8) | (u64{255} << 20));
                 break;
             }
-            if (insn.Bits(72, 1) || insn.Bits(74, 1) || insn.Bits(80, 1) ||
+            if (insn.Bits(74, 1)) {
+                // LEA.HI.X with a constant base: the shifted high word plus the carry predicate.
+                const u32 b = operand(1, false);
+                const u64 shift = (u64{32 - insn.Bits(75, 5)} << 20) | (u64{insn.Bits(73, 1)} << 48);
+                emit(0x3828000000000000ULL | predicate | 250 | (u64{insn.Bits(24, 8)} << 8) | shift);
+                emit(0x5c10000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{b} << 20));
+                carry_value(insn.Bits(87, 3), insn.Bits(90, 1));
+                emit(base(0x5c10000000000000ULL) | (u64{250} << 8) | (u64{253} << 20));
+                break;
+            }
+            if (insn.Bits(72, 1) || insn.Bits(80, 1) ||
                 insn.Bits(81, 3) == 7 || insn.Bits(62, 2))
                 return fail(index, "native constant LEA carry mode");
             const u32 b = operand(1, false);

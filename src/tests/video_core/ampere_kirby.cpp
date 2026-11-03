@@ -163,7 +163,8 @@ TEST_CASE("Ampere warp reductions reject unsupported modes and uniform destinati
         }};
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
     }
-    for (const u32 destination : {28U, 63U}) {
+    // UR28 and up are mirrored below R216; URZ stays invalid.
+    for (const u32 destination : {63U}) {
         const std::array<Instruction, 2> code{{
             {{0x030073c4U | (destination << 16), 0, 0x4000, 0x000ea200}},
             {{0x0000794d, 0, 0x03800000, 0}},
