@@ -89,7 +89,8 @@ TEST_CASE("Ampere effective addresses accept a uniform addend", "[video_core][am
                      (u64{reg} << 20) | (u64{shift} << 39)));
         }
     }
-    for (const u32 source : {28U, 255U, 0x104U}) {
+    // UR28 and up are mirrored below R216 (LowerToMaxwell lowers again with them).
+    for (const u32 source : {255U, 0x104U}) {
         const std::array<Instruction, 2> code{{
             {{0x04067c11, source, 0x0f8e30ff, 0x020fc800}},
             {{0x0000794d, 0, 0x03800000, 0}},
@@ -100,7 +101,8 @@ TEST_CASE("Ampere effective addresses accept a uniform addend", "[video_core][am
         {{0x04067c11, 4, 0x0f8030ff, 0x020fc800}},
         {{0x0000794d, 0, 0x03800000, 0}},
     }};
-    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(carry)));
+    // A carry out is the low half of a 64-bit address, lowered like the register form's.
+    REQUIRE(static_cast<bool>(LowerToMaxwell(carry)));
     auto scratch = carry;
     scratch[0].words[0] = 0xd8067c11;
     scratch[0].words[2] = 0x0f8e30ff;

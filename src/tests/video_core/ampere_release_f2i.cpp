@@ -116,7 +116,8 @@ TEST_CASE("Ampere unflushed truncating F2I rejects reserved fields and modes",
     invalid = RegisterTruncation;
     invalid[0].words = {0x00027d05, 5, 0x0020f000, 0x000e3000};
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
-    for (const u32 source : {28U, 62U, 64U}) {
+    // UR28-UR62 are mirrored below R216; 64 is no uniform register.
+    for (const u32 source : {64U}) {
         invalid = RegisterTruncation;
         invalid[0].words = {0x00027d05, source, 0x0820f000, 0x000e3000};
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));

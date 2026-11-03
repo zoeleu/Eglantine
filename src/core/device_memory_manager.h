@@ -19,6 +19,7 @@
 #include "common/common_types.h"
 #include "common/range_mutex.h"
 #include "common/scratch_buffer.h"
+#include "common/thread_worker.h"
 #include "common/sparse_large_vector.h"
 
 namespace Core {
@@ -53,6 +54,10 @@ public:
     static constexpr size_t AS_BITS = Traits::device_virtual_bits;
 
     void BindInterface(DeviceInterface* device_inter);
+
+    /// Marks the memory behind [address, address + size) cold (Common::HostMemory::HintCold),
+    /// from a low-priority thread: data the host GPU has its own copy of, e.g. uploaded textures.
+    void HintCold(DAddr address, size_t size);
 
     DAddr Allocate(size_t size);
     void AllocateFixed(DAddr start, size_t size);
@@ -205,7 +210,9 @@ private:
     std::unique_ptr<DeviceMemoryManagerAllocator<Traits>> impl;
 
     const uintptr_t physical_base;
+    const DeviceMemory* device_memory_ptr;
     DeviceInterface* device_inter;
+    std::unique_ptr<Common::ThreadWorker> cold_hint_worker;
 
     struct TrackedEntry {
         VAddr cpu_backing_address;

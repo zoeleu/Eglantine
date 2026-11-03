@@ -272,7 +272,8 @@ TEST_CASE("Ampere integer multiplication rejects unsupported modifiers",
             REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
         }
     }
-    for (const u32 bit : {8U, 11U, 12U, 13U, 15U}) {
+    // Bit 76 (12 here) alone selects IDP.2A, lowered on its own.
+    for (const u32 bit : {8U, 11U, 13U, 15U}) {
         const Instruction invalid{{0x02007226, 4, 6U | (1U << bit), 0}};
         REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
     }

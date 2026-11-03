@@ -9,7 +9,8 @@
 
 TEST_CASE("Ampere ordinary gathers reject unproved half precision modes",
           "[video_core][ampere][release_guards]") {
-    for (const u32 precision : {1U, 2U, 3U}) {
+    // Precision 1 (.F16, bit 79) is lowered: the results are packed in pairs.
+    for (const u32 precision : {2U, 3U}) {
         const std::array<Shader::Ampere::Instruction, 2> code{{
             {{0x06027b63, 0x33c04407, 0x041e0f01U | (precision << 15), 0x000fc200}},
             {{0x0000794d, 0, 0x03800000, 0}},
@@ -35,12 +36,11 @@ TEST_CASE("Ampere IADD3.X with a third source rejects carry outputs and a second
         return Shader::Ampere::LowerToMaxwell(code);
     };
     REQUIRE(static_cast<bool>(lower(plain)));
+    // Carry outputs and a second carry input take the three-input path, which counts the carries.
     for (const u32 word2 : {(plain & ~(7U << 17)) | (1U << 17),    // carry out P1
                             (plain & ~(7U << 20)) | (1U << 20),    // second carry out P1
                             (plain & ~(15U << 13)) | (1U << 13)}) { // second carry in P1
-        const auto lowered = lower(word2);
-        REQUIRE_FALSE(static_cast<bool>(lowered));
-        REQUIRE(lowered.error == "native integer carry mode");
+        REQUIRE(static_cast<bool>(lower(word2)));
     }
 }
 

@@ -29,7 +29,8 @@ TEST_CASE("Ampere reciprocal accepts the captured uniform source form", "[video_
     const auto predicated = LowerToMaxwell(code);
     REQUIRE(static_cast<bool>(predicated));
     REQUIRE(((predicated.instructions.front() >> 16) & 15) == 1);
-    for (const u32 source : {28U, 62U, 64U, 0x80000008U}) {
+    // UR28-UR62 are mirrored below R216.
+    for (const u32 source : {64U, 0x80000008U}) {
         auto invalid = code;
         invalid[0].words[1] = source;
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
@@ -44,14 +45,13 @@ TEST_CASE("Ampere reciprocal accepts the captured uniform source form", "[video_
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(alias)));
 }
 
-TEST_CASE("Ampere clip-state operations remain explicitly unsupported", "[video_core][ampere]") {
+TEST_CASE("Ampere CSM tests are lowered as false", "[video_core][ampere]") {
+    // Shading-mode state is not modeled; CSMTEST writing PT leaves nothing to do.
     const std::array<Instruction, 2> code{{
         {{0x0000780d, 0xc4321111, 0x03fe0000, 0x000fc800}},
         {{0x0000794d, 0, 0x03800000, 0}},
     }};
-    const auto lowered = LowerToMaxwell(code);
-    REQUIRE_FALSE(static_cast<bool>(lowered));
-    REQUIRE(lowered.instructions.empty());
+    REQUIRE(static_cast<bool>(LowerToMaxwell(code)));
 }
 
 TEST_CASE("Ampere floating comparisons accept uniform sources without losing FTZ",
@@ -66,7 +66,7 @@ TEST_CASE("Ampere floating comparisons accept uniform sources without losing FTZ
             (0x5bb0000000070000ULL | 7ULL | (255ULL << 8) | (220ULL << 20) | (7ULL << 39) |
              (1ULL << 47) | (12ULL << 48)));
     auto invalid = code;
-    invalid[0].words[1] = 28;
+    invalid[0].words[1] = 64;
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
     auto alias = code;
     alias[0].words[0] = 0xdc007c0b;
@@ -113,13 +113,18 @@ TEST_CASE("Ampere local spills preserve vector widths and zero-register stores",
     }
 }
 
-TEST_CASE("Ampere local vector spills reject misalignment and scratch aliasing",
+TEST_CASE("Ampere local vector spills split misaligned accesses and reject scratch aliasing",
           "[video_core][ampere]") {
     const std::array<Instruction, 2> misaligned{{
         {{0xff007387, 0x404, 0x00100c00, 0x000fe200}},
         {{0x0000794d, 0, 0x03800000, 0}},
     }};
-    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(misaligned)));
+    // Not 16-byte aligned: four 32-bit stores.
+    const auto split = LowerToMaxwell(misaligned);
+    REQUIRE(static_cast<bool>(split));
+    for (u32 word = 0; word < 4; ++word)
+        REQUIRE(split.instructions[word] == (0xef50000000070000ULL | (4ULL + word) | (255ULL << 8) |
+                                             (u64{4 + 4 * word} << 20) | (4ULL << 48)));
     const std::array<Instruction, 2> scratch{{
         {{0xff007387, 244, 0x00100c00, 0x000fe200}},
         {{0x0000794d, 0, 0x03800000, 0}},
@@ -150,7 +155,8 @@ TEST_CASE("Ampere warp reductions retain their operation and active-lane mask",
 
 TEST_CASE("Ampere warp reductions reject unsupported modes and uniform destinations",
           "[video_core][ampere]") {
-    for (const u32 mode : {0U, 0x8000U, 0x14200U}) {
+    // 0x8000 is REDUX.XOR, lowered like the OR.
+    for (const u32 mode : {0U, 0x14200U}) {
         const std::array<Instruction, 2> code{{
             {{0x030673c4, 0, mode, 0x000ea200}},
             {{0x0000794d, 0, 0x03800000, 0}},
